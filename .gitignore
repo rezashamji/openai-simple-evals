@@ -130,3 +130,19 @@ dmypy.json
 
 # Slurm job logs
 logs/
+
+# --- Local assets / outputs (do not commit) ---
+2025-05-07-06-14-12_oss_eval.jsonl
+healthbench-venv/
+.venv/
+model_weights/
+responses_*.jsonl
+responses_*.json
+responses_*.html
+
+# Option A: do not vendor this package
+openai_simple_evals/
+
+# Local utilities not part of ARK↔HealthBench benchmark
+inspect_healthbench_data.py
+run_healthbench_rbio.py
