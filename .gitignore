@@ -1,0 +1,5 @@
+# Local env (API keys). Do not commit.
+.env
+
+# Slurm job logs
+logs/
