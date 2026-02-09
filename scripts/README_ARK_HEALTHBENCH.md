@@ -44,7 +44,7 @@ Model used for nodes→NL and for the grader is **azure/gpt-4.1** (same as ARK).
 
 ## Run
 
-From the project root (`/n/netscratch/mzitnik_lab/Lab/rshamji`) (venv activated, Azure env vars set, e.g. `set -a && source healthbench/.env && set +a`):
+From the project root (`/n/holylfs06/LABS/mzitnik_lab/Users/rshamji/rshamji`) (venv activated, Azure env vars set, e.g. `set -a && source healthbench/.env && set +a`):
 
 ```bash
 # Phase 1: HealthBench Qs → ARK → nodes→NL → response jsonl
