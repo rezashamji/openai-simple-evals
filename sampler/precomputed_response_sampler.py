@@ -46,6 +46,20 @@ class PrecomputedResponseSampler(SamplerBase):
         # HealthBenchEval calls __call__ once per example in order; we serve the next line each time.
         self._index = 0
 
+    def get_response_at_index(self, i: int, message_list: MessageList) -> SamplerResponse:
+        """Return precomputed response for index i (for checkpoint/resume loops with random access)."""
+        if i < 0 or i >= len(self._responses):
+            raise IndexError(
+                f"PrecomputedResponseSampler: no response for index {i} (have {len(self._responses)} responses)"
+            )
+        row = self._responses[i]
+        response_text = row.get("response_text", "")
+        return SamplerResponse(
+            response_text=response_text,
+            actual_queried_message_list=message_list,
+            response_metadata={},
+        )
+
     def __call__(self, message_list: MessageList) -> SamplerResponse:
         """
         Return the next precomputed response. message_list is the prompt HealthBench passed
