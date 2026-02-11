@@ -26,9 +26,9 @@ INPUT_JSONL="${HEALTHBENCH_DIR}/2025-05-07-06-14-12_oss_eval.jsonl"
 OUTPUT_JSONL="${HEALTHBENCH_DIR}/responses_ark_healthbench.jsonl"
 
 # Phase 1: parallel questions (more workers = faster; tune to API limits)
-N_WORKERS=2
+N_WORKERS=4
 # Phase 2: grading threads (HealthBench default 120; higher can speed if API allows)
-N_THREADS=50
+N_THREADS=10
 
 # ARK run config (passed explicitly so you can change for other runs)
 GRAPH_NAME=prime
