@@ -10,14 +10,38 @@ We use **two oracles** and write **only the glue** between them.
 
 ## Our code (four steps)
 
-1. **Deconstruct HealthBench** – Read eval jsonl, extract questions (same order as HealthBench uses: `random.Random(0).sample`).
-2. **Call ARK oracle** – For each question, subprocess `ark/benchmarks/stark/run_one_question.py` → get nodes JSON.
-3. **Nodes → NL** – One LLM call per example to turn node summaries + question into natural language. Write response jsonl.
+1. **Deconstruct HealthBench** – Read eval jsonl; for each example we use the **full conversation** (same order as HealthBench: `random.Random(0).sample`).
+2. **Call ARK oracle** – For each example, subprocess `ark/benchmarks/stark/run_one_question.py` with the full conversation by default (or user turns only via `--ark-input user_only`) → get nodes JSON.
+3. **Nodes → NL** – One LLM call per example: **full HealthBench conversation** + one user message with KG context and neutral instruction; model continues (answer, follow-up, etc.). Write response jsonl.
 4. **Call HealthBench eval oracle** – Run `grade_ark_healthbench_responses.py` on the response jsonl → metrics.
+
+Phase 1 passes the **full HealthBench conversation** to the model and (by default) to ARK so the benchmark matches HealthBench. Use `--ark-input user_only` to send only user turns to ARK (e.g. for ablations).
+
+## Setup venv (once per clone / before first Slurm run)
+
+Slurm jobs expect **healthbench/.venv** (Python 3.12, with blobfile, litellm, tqdm). From project root:
+
+```bash
+bash healthbench/scripts/setup_healthbench_venv.sh
+```
+
+This copies `healthbench/.venv.bak` to `healthbench/.venv` (or creates a new venv) and installs blobfile (and litellm/tqdm if missing).
+
+## Quick test (before full Slurm run)
+
+From project root, with Azure `.env` in place:
+
+```bash
+bash healthbench/scripts/run_small_ark_healthbench_test.sh
+```
+
+Runs Phase 1 with `--limit 2` then Phase 2 on that output. If both complete, the full Slurm run should work.
 
 ## Files
 
 - **run_ark_on_healthbench.py** – Phase 1: steps 1–3 (get Qs, ARK oracle, nodes→NL, write jsonl).
+- **setup_healthbench_venv.sh** – One-time setup: ensure healthbench/.venv exists and has blobfile (and deps).
+- **run_small_ark_healthbench_test.sh** – Quick test: Phase 1 (limit 2) + Phase 2 to verify pipeline.
 - **grade_ark_healthbench_responses.py** – Phase 2: step 4 (run HealthBench eval on response jsonl; no grading logic ours).
 - **run_ark_healthbench_full.slurm** – One-job run: Phase 1 then Phase 2 (edit variables at top for paths, graph/model, N_WORKERS, N_THREADS).
 - **tests/test_ark_healthbench.py** – Minimal tests (question extraction, Phase 2 with mock grader).
@@ -57,6 +81,7 @@ python -m healthbench.scripts.run_ark_on_healthbench \
 # Optional: pass graph/model so the run is explicit (defaults: prime, azure/gpt-4.1, 3 agents, 20 steps)
 # --graph-name prime --ark-model azure/gpt-4.1 --ark-agents 3 --ark-max-steps 20
 # Optional: parallel questions (default 1) --n-workers 8
+# Optional: --ark-input user_only to send only user turns to ARK (default: full_conversation)
 
 # Phase 2: response jsonl → HealthBench eval → metrics
 python -m healthbench.scripts.grade_ark_healthbench_responses --responses-jsonl healthbench/responses.jsonl
