@@ -6,16 +6,22 @@ Phase 1: Our only logic. Four steps total; we use two oracles and do minimal glu
     (run_one_question.py): question in → JSON with nodes+summaries out.
 
   OUR CODE:
-    1. Deconstruct HealthBench dataset → get questions (same order as HealthBench eval).
-    2. For each question: call ARK oracle → parse nodes JSON.
-    3. nodes→NL: one LLM call to turn node summaries + question into natural language.
+    1. Deconstruct HealthBench dataset → get full conversation per example (same order as HealthBench eval).
+    2. For each example: call ARK oracle with full conversation (or user-only via --ark-input user_only) → parse nodes JSON.
+    3. nodes→NL: one LLM call with full HealthBench conversation + KG context; model continues (e.g. answer or follow-up). Write response jsonl.
     4. Write response jsonl (one line per example).
+
+  We pass the full HealthBench conversation to the model and (by default) to ARK so the benchmark matches HealthBench: model sees full context and decides how to continue.
 
   ORACLE 2 – HealthBench eval: takes response jsonl, grades on rubrics, returns metrics.
     We do not implement grading. Phase 2 is grade_ark_healthbench_responses.py (calls their eval).
 
   ARK config: pass --graph-name, --ark-model, --ark-agents, --ark-max-steps when you run
   (e.g. from Slurm). Paper Appendix A.2 uses Prime KG, GPT-4.1, n=3 agents, Tmax=20.
+
+  Resume: If --output-jsonl already exists, we load it and reuse results by prompt_id (no
+  line-count assumption). We only run ARK+nodes_to_nl for examples whose prompt_id is not
+  in the file, then write the full jsonl in current eval order so Phase 2 stays correct.
 """
 
 import argparse
@@ -29,27 +35,71 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 def get_question_from_prompt(prompt: list) -> str:
-    """Extract user content from HealthBench prompt (list of message dicts). Same order as eval."""
+    """Extract user content from HealthBench prompt (list of message dicts). Same order as eval. Optional for ARK via --ark-input user_only."""
     parts = [m["content"] for m in prompt if m.get("role") == "user"]
     return "\n\n".join(parts).strip() if parts else ""
 
 
-def nodes_to_nl(question: str, node_summaries: list, model_name: str = "azure/gpt-4.1") -> str:
-    """Our only logic beyond glue: turn ARK's node summaries + question into one NL reply.
-    Uses LiteLLM + AZURE_* env (same as ARK) so we use the same model/API."""
+def format_prompt_as_conversation_string(prompt: list) -> str:
+    """Format full HealthBench prompt (message list) as a single string for ARK: 'user: ...\\n\\nassistant: ...'."""
+    return "\n\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in prompt).strip()
+
+
+def load_id_to_result(path: Path) -> dict[str, dict]:
+    """Load existing output jsonl into prompt_id -> result dict. Used for resume. Skips bad lines."""
+    id_to_result: dict[str, dict] = {}
+    if not path.exists():
+        return id_to_result
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+                pid = d.get("prompt_id")
+                if pid is not None:
+                    id_to_result[pid] = d
+            except json.JSONDecodeError:
+                pass
+    return id_to_result
+
+
+def get_resume_to_compute(examples: list[dict], id_to_result: dict[str, dict]) -> list[int]:
+    """Indices to compute when resuming: those whose prompt_id is not in id_to_result."""
+    done_prompt_ids = set(id_to_result.keys())
+    return [i for i, row in enumerate(examples) if row.get("prompt_id", str(i)) not in done_prompt_ids]
+
+
+def build_results_in_order(
+    examples: list[dict], id_to_result: dict[str, dict], new_results: dict[int, dict]
+) -> list[dict]:
+    """Merge cache and newly computed results in eval order for Phase 2 alignment."""
+    results = []
+    for i, row in enumerate(examples):
+        pid = row.get("prompt_id", str(i))
+        if pid in id_to_result:
+            results.append(id_to_result[pid])
+        else:
+            results.append(new_results[i])
+    return results
+
+
+def nodes_to_nl(prompt: list, node_summaries: list, model_name: str = "azure/gpt-4.1") -> str:
+    """Turn ARK's node summaries + full HealthBench conversation into next-turn response.
+    Model sees full conversation + one user message with KG context and neutral instruction; model continues (answer, follow-up, etc.).
+    Uses LiteLLM + AZURE_* env (same as ARK)."""
     from litellm import completion
     if not node_summaries:
         return "I could not find relevant information in the knowledge base for this question."
     blocks = [s.get("summary") or s.get("name") or f"(node {s.get('index', '')})" for s in node_summaries]
     context = "\n\n".join(blocks)
-    prompt_text = f"""Question: {question}
-
-The following is relevant information from the knowledge graph. Each paragraph (block of text separated by a blank line) is one item, ordered from most to least relevant to the question.
+    kg_user_content = f"""The following is relevant information from the knowledge graph. Each paragraph (block of text separated by a blank line) is one item, ordered from most to least relevant to the question.
 
 {context}
 
-Using the relevant information above, write a complete, helpful reply to the question as a supportive assistant. Do not mention nodes, indices, or the graph."""
-    messages = [{"role": "user", "content": prompt_text}]
+Use it as appropriate to continue the conversation."""
+    messages = list(prompt) + [{"role": "user", "content": kg_user_content}]
     api_key = os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("AZURE_API_KEY")
     api_base = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get("AZURE_OPENAI_API_BASE") or os.environ.get("AZURE_API_BASE")
     api_version = os.environ.get("AZURE_OPENAI_API_VERSION") or os.environ.get("AZURE_API_VERSION")
@@ -79,6 +129,13 @@ def main():
     parser.add_argument("--ark-model", type=str, default="azure/gpt-4.1", help="ARK backbone. Pass when you run (e.g. azure/gpt-4.1).")
     parser.add_argument("--ark-agents", type=int, default=3, help="ARK parallel agents (paper A.2: n=3).")
     parser.add_argument("--ark-max-steps", type=int, default=20, help="ARK max steps per trajectory (paper A.2: Tmax=20).")
+    parser.add_argument(
+        "--ark-input",
+        type=str,
+        choices=["full_conversation", "user_only"],
+        default="full_conversation",
+        help="What to send to ARK: full_conversation (default, conversation-aware retrieval) or user_only (user turns only, e.g. for ablations).",
+    )
     args = parser.parse_args()
 
     ark_dir = Path(args.ark_dir).resolve()
@@ -100,15 +157,24 @@ def main():
     output_path = Path(args.output_jsonl)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Resume: load existing output by prompt_id so we skip already-done examples (no line-count assumption).
+    id_to_result = load_id_to_result(output_path)
+    to_compute = get_resume_to_compute(examples, id_to_result)
+    if id_to_result:
+        print(f"Resuming: reusing {len(id_to_result)} results by prompt_id, computing {len(to_compute)}.", file=sys.stderr)
+
     def process_one(idx: int, row: dict) -> tuple[int, dict]:
-        """Run ARK for one question, then nodes_to_nl. Returns (idx, output_dict) for ordered write."""
+        """Run ARK for one example, then nodes_to_nl. Returns (idx, output_dict) for ordered write."""
         prompt_id = row.get("prompt_id", str(idx))
         prompt = row.get("prompt", [])
         rubrics = row.get("rubrics", [])
         example_tags = row.get("example_tags", [])
-        question = get_question_from_prompt(prompt) or "(No user message)"
+        if args.ark_input == "user_only":
+            question_for_ark = get_question_from_prompt(prompt) or "(No user message)"
+        else:
+            question_for_ark = format_prompt_as_conversation_string(prompt) or "(No messages)"
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-            f.write(question)
+            f.write(question_for_ark)
             q_file = f.name
         # Paper A.2: Prime, GPT-4.1, 3 agents, Tmax=20 (passed explicitly)
         cmd = [
@@ -141,7 +207,7 @@ def main():
                 if ark_out.get("error"):
                     response_text = ""
                 else:
-                    response_text = nodes_to_nl(question, ark_out.get("node_summaries", []), args.nl_model)
+                    response_text = nodes_to_nl(prompt, ark_out.get("node_summaries", []), args.nl_model)
         return (idx, {
             "prompt_id": prompt_id,
             "prompt": prompt,
@@ -150,28 +216,32 @@ def main():
             "example_tags": example_tags,
         })
 
+    new_results: dict[int, dict] = {}
     n_workers = max(1, int(args.n_workers))
-    if n_workers == 1:
-        results = [None] * len(examples)
-        for i, row in enumerate(examples):
-            _, out = process_one(i, row)
-            results[i] = out
-            if (i + 1) % 10 == 0 or (i + 1) == len(examples):
-                print(f"  {i + 1}/{len(examples)} done.", file=sys.stderr)
-    else:
-        results = [None] * len(examples)
-        done = 0
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {executor.submit(process_one, i, row): i for i, row in enumerate(examples)}
-            for future in as_completed(futures):
-                i, out = future.result()
-                results[i] = out
-                done += 1
-                if done % 10 == 0 or done == len(examples):
-                    print(f"  {done}/{len(examples)} done.", file=sys.stderr)
-        for i, out in enumerate(results):
-            if out is None:
+    if to_compute:
+        if n_workers == 1:
+            for k, i in enumerate(to_compute):
+                _, out = process_one(i, examples[i])
+                new_results[i] = out
+                if (k + 1) % 10 == 0 or (k + 1) == len(to_compute):
+                    print(f"  {k + 1}/{len(to_compute)} computed.", file=sys.stderr)
+        else:
+            done = 0
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = {executor.submit(process_one, i, examples[i]): i for i in to_compute}
+                for future in as_completed(futures):
+                    i, out = future.result()
+                    new_results[i] = out
+                    done += 1
+                    if done % 10 == 0 or done == len(to_compute):
+                        print(f"  {done}/{len(to_compute)} computed.", file=sys.stderr)
+        for i in to_compute:
+            if i not in new_results:
                 raise RuntimeError(f"Missing result for example index {i}")
+
+    # Build full results in eval order (cache + newly computed) so Phase 2 index alignment holds.
+    results = build_results_in_order(examples, id_to_result, new_results)
+
     with open(output_path, "w", encoding="utf-8") as out_f:
         for out in results:
             out_f.write(json.dumps(out, ensure_ascii=False) + "\n")
