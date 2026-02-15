@@ -20,7 +20,13 @@ REPO_PARENT = REPO_ROOT.parent
 if str(REPO_PARENT) not in sys.path:
     sys.path.insert(0, str(REPO_PARENT))
 
-from healthbench.scripts.run_ark_on_healthbench import get_question_from_prompt
+from healthbench.scripts.run_ark_on_healthbench import (
+    build_results_in_order,
+    format_prompt_as_conversation_string,
+    get_question_from_prompt,
+    get_resume_to_compute,
+    load_id_to_result,
+)
 
 
 def test_get_question_from_prompt():
@@ -32,6 +38,60 @@ def test_get_question_from_prompt():
         {"role": "user", "content": "Follow-up."},
     ]) == "First.\n\nFollow-up."
     assert get_question_from_prompt([{"role": "assistant", "content": "x"}]) == ""
+
+
+def test_format_prompt_as_conversation_string():
+    """Full convo is formatted as user/assistant/user string for ARK."""
+    assert format_prompt_as_conversation_string([
+        {"role": "user", "content": "First."},
+        {"role": "assistant", "content": "Reply."},
+        {"role": "user", "content": "Follow-up."},
+    ]) == "user: First.\n\nassistant: Reply.\n\nuser: Follow-up."
+    assert format_prompt_as_conversation_string([{"role": "user", "content": "Hi"}]) == "user: Hi"
+
+
+def test_resume_logic():
+    """Resume: load by prompt_id, to_compute, and merge in eval order."""
+    # load_id_to_result: missing file -> empty; existing file -> prompt_id -> dict
+    assert load_id_to_result(Path("/nonexistent/path.jsonl")) == {}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8") as f:
+        f.write(json.dumps({"prompt_id": "a", "response_text": "A"}) + "\n")
+        f.write(json.dumps({"prompt_id": "b", "response_text": "B"}) + "\n")
+        f.write(json.dumps({"not_prompt_id": "x"}) + "\n")  # no prompt_id, skipped
+        f.write("bad json\n")  # skipped
+        path = Path(f.name)
+    try:
+        id_to_result = load_id_to_result(path)
+        assert set(id_to_result.keys()) == {"a", "b"}
+        assert id_to_result["a"]["response_text"] == "A"
+        assert id_to_result["b"]["response_text"] == "B"
+    finally:
+        path.unlink(missing_ok=True)
+
+    # get_resume_to_compute: only indices whose prompt_id is not in cache
+    examples = [
+        {"prompt_id": "a", "prompt": []},
+        {"prompt_id": "b", "prompt": []},
+        {"prompt_id": "c", "prompt": []},
+    ]
+    to_compute = get_resume_to_compute(examples, {"a": {}})
+    assert to_compute == [1, 2]
+    to_compute_none = get_resume_to_compute(examples, {"a": {}, "b": {}, "c": {}})
+    assert to_compute_none == []
+    to_compute_all = get_resume_to_compute(examples, {})
+    assert to_compute_all == [0, 1, 2]
+
+    # build_results_in_order: eval order preserved; cache used when prompt_id in id_to_result
+    examples2 = [
+        {"prompt_id": "p1"},
+        {"prompt_id": "p2"},
+    ]
+    id_to_result2 = {"p1": {"prompt_id": "p1", "response_text": "cached1"}}
+    new_results2 = {1: {"prompt_id": "p2", "response_text": "new2"}}
+    results = build_results_in_order(examples2, id_to_result2, new_results2)
+    assert len(results) == 2
+    assert results[0]["prompt_id"] == "p1" and results[0]["response_text"] == "cached1"
+    assert results[1]["prompt_id"] == "p2" and results[1]["response_text"] == "new2"
 
 
 def test_phase2_grade_with_mock_grader():
@@ -78,6 +138,8 @@ def test_phase2_grade_with_mock_grader():
 
 def run_all():
     test_get_question_from_prompt()
+    test_format_prompt_as_conversation_string()
+    test_resume_logic()
     test_phase2_grade_with_mock_grader()
     print("All tests passed.")
 
