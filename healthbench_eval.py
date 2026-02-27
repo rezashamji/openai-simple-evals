@@ -202,6 +202,27 @@ def calculate_score(
     return overall_score
 
 
+def calculate_kg_relevance_score(rubric_items: list[RubricItem], kg_labels: list[dict]) -> float | None:
+    """Calculate KG relevance score from KG labels (helped/hurt/neutral).
+
+    Score = (sum of points where kg_helped - sum of abs points where kg_hurt) / total_positive_points
+    Returns None if no positive-point criteria exist or kg_labels is empty.
+    """
+    if not kg_labels:
+        return None
+
+    total_positive = sum(r.points for r in rubric_items if r.points > 0)
+    if total_positive == 0:
+        return None
+
+    numerator = sum(
+        r.points if kl.get("kg_label") == "kg_helped" else
+        -abs(r.points) if kl.get("kg_label") == "kg_hurt" else 0
+        for r, kl in zip(rubric_items, kg_labels)
+    )
+    return numerator / total_positive
+
+
 def get_usage_dict(response_usage) -> dict[str, int | None]:
     if response_usage is None:
         return {
@@ -592,6 +613,10 @@ class HealthBenchEval(Eval):
                 )
             )
 
+            # Extract KG labels from rubric_items_with_grades for kg_relevance_score calculation
+            kg_labels = [item.get("kg_label") for item in rubric_items_with_grades] if rubric_items_with_grades else []
+            kg_relevance_score = calculate_kg_relevance_score(row["rubrics"], [{"kg_label": label} for label in kg_labels])
+
             score = metrics["overall_score"]
 
             # Create HTML for each sample result
@@ -625,8 +650,11 @@ class HealthBenchEval(Eval):
                     "completion_id": hashlib.sha256(
                         (row["prompt_id"] + response_text).encode("utf-8")
                     ).hexdigest(),
-                    "kg_reasoning_details": kg_reasoning_details,
                     "run_tag": row.get("run_tag", "no_kg"),
+                    "node_summaries": row.get("node_summaries", []),
+                    "node_contributions": row.get("node_contributions", {}),
+                    "kg_relevance_score": kg_relevance_score,
+                    "kg_reasoning_details": kg_reasoning_details,
                 },
             )
 
