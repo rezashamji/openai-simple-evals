@@ -581,6 +581,11 @@ class HealthBenchEval(Eval):
             # For no_kg runs: label as None (not applicable)
             kg_labels = [{"kg_label": None, "kg_reasoning": None}] * len(rubric_items)
 
+        # Add kg_relevance_score to metrics dict for aggregation (Step 5 Part B)
+        kg_relevance_score_for_metrics = calculate_kg_relevance_score(rubric_items, kg_labels)
+        if kg_relevance_score_for_metrics is not None:
+            metrics["kg_relevance_score"] = kg_relevance_score_for_metrics
+
         return metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
