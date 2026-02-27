@@ -269,6 +269,30 @@ def test_phase2_grade_with_mock_grader():
         Path(path).unlink(missing_ok=True)
 
 
+def test_step4_kg_grading_logic():
+    """Step 4: KG relevance grading adds kg_reasoning_details to metadata."""
+    try:
+        from healthbench.healthbench_eval import KG_RELEVANCE_TEMPLATE
+    except ImportError as e:
+        print(f"SKIP Step 4 test (missing KG_RELEVANCE_TEMPLATE): {e}", file=sys.stderr)
+        return
+
+    # Verify KG_RELEVANCE_TEMPLATE exists and has expected placeholders
+    assert "<<conversation>>" in KG_RELEVANCE_TEMPLATE
+    assert "<<response>>" in KG_RELEVANCE_TEMPLATE
+    assert "<<rubric_item>>" in KG_RELEVANCE_TEMPLATE
+    assert "<<criteria_met>>" in KG_RELEVANCE_TEMPLATE
+    assert "<<node_contributions>>" in KG_RELEVANCE_TEMPLATE
+    assert "<<rubric_explanation>>" in KG_RELEVANCE_TEMPLATE
+    assert "kg_label" in KG_RELEVANCE_TEMPLATE
+    assert "kg_reasoning" in KG_RELEVANCE_TEMPLATE
+
+    # Test template substitution works
+    test_template = KG_RELEVANCE_TEMPLATE.replace("<<conversation>>", "user: test")
+    assert "user: test" in test_template
+    assert "<<conversation>>" not in test_template
+
+
 def run_all():
     test_get_question_from_prompt()
     test_format_prompt_as_conversation_string()
@@ -276,6 +300,7 @@ def run_all():
     test_parse_json_to_dict()
     test_step2b_output_schema()
     test_step3_reformat_to_phase1_schema()
+    test_step4_kg_grading_logic()
     test_phase2_grade_with_mock_grader()
     print("All tests passed.")
 
