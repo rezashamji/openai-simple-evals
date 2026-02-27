@@ -27,25 +27,23 @@ from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-# Import the upstream HealthBench implementation in this repo as a package.
-# That code uses relative imports (e.g., `from . import common`), so we need the
-# parent directory on sys.path and `healthbench/__init__.py` present.
-repo_root = Path(__file__).resolve().parent.parent  # .../healthbench
-repo_parent = repo_root.parent  # .../rshamji
-if str(repo_parent) not in sys.path:
-    sys.path.insert(0, str(repo_parent))
+# Import from root of simple-evals repo (all files at root level, not in healthbench/ package)
+repo_root = Path(__file__).resolve().parent.parent  # .../simple-evals
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
-from healthbench import common, healthbench_eval  # type: ignore
-from healthbench.healthbench_eval import (  # type: ignore
+import common  # type: ignore
+import healthbench_eval  # type: ignore
+from healthbench_eval import (  # type: ignore
     HEALTHBENCH_HTML_JINJA,
     HealthBenchEval,
     _aggregate_get_clipped_mean,
     get_usage_dict,
 )
-from healthbench.sampler.precomputed_response_sampler import (  # type: ignore
+from sampler.precomputed_response_sampler import (  # type: ignore
     PrecomputedResponseSampler,
 )
-from healthbench.types import MessageList, SamplerResponse, SingleEvalResult  # type: ignore
+from types import MessageList, SamplerResponse, SingleEvalResult  # type: ignore
 
 # Avoid importing OpenAI SDK just to get this constant.
 OPENAI_SYSTEM_MESSAGE_API = "You are a helpful assistant."
@@ -208,6 +206,12 @@ def main():
         help="Path to grading checkpoint JSONL (default: {output_dir}/{stem}_grading_checkpoint.jsonl). "
         "Enables resumable grading after crashes.",
     )
+    parser.add_argument(
+        "--validate-node-contributions",
+        action="store_true",
+        default=False,
+        help="Enable cross-checking of node contribution claims against raw node summaries (KG enrichment).",
+    )
     args = parser.parse_args()
 
     response_path = Path(args.responses_jsonl)
@@ -286,11 +290,20 @@ def main():
             response_usage = sampler_response.response_metadata.get("usage", None)
             actual_queried_prompt_messages = sampler_response.actual_queried_message_list
 
-            metrics, readable_explanation_str, rubric_items_with_grades = eval_obj.grade_sample(
+            # Extract KG-related fields from row (Phase 1 output)
+            node_contributions = row.get("node_contributions", {})
+            node_summaries = row.get("node_summaries", [])
+            run_tag = row.get("run_tag", "no_kg")
+
+            metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details = eval_obj.grade_sample(
                 prompt=actual_queried_prompt_messages,
                 response_text=response_text,
                 rubric_items=row["rubrics"],
                 example_tags=row["example_tags"],
+                node_contributions=node_contributions,
+                node_summaries=node_summaries,
+                run_tag=run_tag,
+                validate_node_contributions=args.validate_node_contributions,
             )
             score = metrics["overall_score"]
 
@@ -321,6 +334,8 @@ def main():
                     "completion_id": hashlib.sha256(
                         (prompt_id + response_text).encode("utf-8")
                     ).hexdigest(),
+                    "kg_reasoning_details": kg_reasoning_details,
+                    "run_tag": row.get("run_tag", "no_kg"),
                 },
             )
             completed[i] = single_result
