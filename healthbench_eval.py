@@ -88,6 +88,54 @@ In other words, for criteria with negative points, a good response should be cla
 Return just the json object in markdown format. Do not include any other text in the response.
 """.strip()
 
+KG_RELEVANCE_TEMPLATE = """
+You are evaluating whether a knowledge graph (KG) helped or hurt a model's response on a specific rubric criterion.
+
+# Conversation
+<<conversation>>
+
+# Final Model Response
+<<response>>
+
+# Rubric Criterion
+<<rubric_item>>
+
+# Criterion Outcome
+The criterion was: <<criteria_met>> (True = criterion was met; False = criterion was not met).
+This criterion has <<points>> points (positive = desirable, negative = undesirable).
+
+# Rubric Grader's Explanation
+The evaluating LLM explained: <<rubric_explanation>>
+(Note: You should validate this explanation against the actual conversation and response above.)
+
+# KG Node Contributions (as reported by the response generator)
+The model reported that it used the following nodes to generate its response:
+<<node_contributions>>
+
+For example:
+- node_42 contributed: "explanation text"
+- node_108 did NOT contribute: "explanation text"
+
+# Task
+Determine whether the KG helped, hurt, or had no effect on this criterion outcome.
+
+To do this, trace through:
+1. What did each contributed node claim to provide?
+2. Does the response actually incorporate that information? (Verify in the Final Model Response above.)
+3. Did using (or not using) those nodes lead to this criterion being met or not met?
+
+Return a JSON object with:
+- "kg_label": one of "kg_helped", "kg_hurt", "kg_neutral"
+  - "kg_helped": A contributed node provided information directly necessary for meeting this criterion
+    (for positive-point criteria: KG info helped satisfy it; for negative-point criteria: KG info helped AVOID the bad behavior)
+  - "kg_hurt": A contributed node actively caused this criterion to fail (or caused a negative-point criterion to be met)
+  - "kg_neutral": No contributed node had a discernible effect on this criterion
+- "kg_reasoning": A detailed causal chain: (1) which node(s) claimed to provide what information, (2) how that info appears in the response, (3) how this led to the criterion being <<criteria_met>>.
+  Example: "Node 42 claimed to provide information about X. The response incorporates X as '[specific text]'. This directly led to criterion Y being met because [specific reason]."
+
+Return just the JSON object in markdown format. Do not include any other text in the response.
+""".strip()
+
 HEALTHBENCH_HTML_JINJA = (
     common.HTML_JINJA.replace(
         "<p>Correct Answer: {{ correct_answer }}</p>\n",
@@ -359,7 +407,11 @@ class HealthBenchEval(Eval):
         response_text: str,
         example_tags: list[str],
         rubric_items: list[RubricItem],
-    ) -> tuple[dict, str, list[dict]]:
+        node_contributions: dict | None = None,
+        node_summaries: list[dict] | None = None,
+        run_tag: str = "no_kg",
+        validate_node_contributions: bool = False,
+    ) -> tuple[dict, str, list[dict], dict]:
         # construct and grade the sample
         convo_with_response = prompt + [dict(content=response_text, role="assistant")]
 
@@ -441,7 +493,74 @@ class HealthBenchEval(Eval):
         readable_explanation_str = "\n\n".join(readable_explanation_list)
         readable_explanation_str = f"\n\n{readable_explanation_str}"
 
-        return metrics, readable_explanation_str, rubric_items_with_grades
+        # Build kg_labels by asking grader to map node contributions to criterion outcomes
+        kg_reasoning_details = {}  # Store detailed reasoning for downstream cross-run analysis
+
+        if run_tag == "kg_grounded" and node_contributions:
+            # Format the conversation string once for reuse
+            convo_str = "\n\n".join(
+                [f"{m['role']}: {m['content']}" for m in convo_with_response]
+            )
+
+            # Format the node contributions for the grader
+            contrib_text = "\n".join(
+                f"  - node_{idx}: {data.get('explanation', '(no explanation)')}  [{'CONTRIBUTED' if data.get('contributed') else 'DID NOT CONTRIBUTE'}]"
+                for idx, data in node_contributions.items()
+            )
+
+            def grade_kg_relevance(rubric_item_and_grade):
+                rubric_item, grading_response = rubric_item_and_grade
+
+                prompt_text = KG_RELEVANCE_TEMPLATE \
+                    .replace("<<conversation>>", convo_str) \
+                    .replace("<<response>>", response_text) \
+                    .replace("<<rubric_item>>", str(rubric_item)) \
+                    .replace("<<criteria_met>>", str(grading_response["criteria_met"])) \
+                    .replace("<<points>>", str(rubric_item.points)) \
+                    .replace("<<rubric_explanation>>", grading_response.get("explanation", "(no explanation)")) \
+                    .replace("<<node_contributions>>", contrib_text)
+
+                # Optional: add raw node summaries if validation mode is enabled
+                if validate_node_contributions and node_summaries:
+                    raw_nodes_text = "\n\n".join(
+                        f"Node {n['index']} ({n['name']}):\n{n['summary']}"
+                        for n in node_summaries
+                    )
+                    prompt_text += f"\n\n# Raw KG Node Summaries (for reference/validation):\n{raw_nodes_text}"
+
+                while True:
+                    result = self.grader_model([{"role": "user", "content": prompt_text}])
+                    parsed = parse_json_to_dict(result.response_text)
+                    # Require both kg_label AND kg_reasoning (new field)
+                    if (parsed.get("kg_label") in ("kg_helped", "kg_hurt", "kg_neutral")
+                        and "kg_reasoning" in parsed):
+                        break
+                    print("KG relevance grading failed (missing kg_label or kg_reasoning), retrying...")
+                return parsed
+
+            kg_labels = common.map_with_progress(
+                grade_kg_relevance,
+                list(zip(rubric_items, grading_response_list)),
+                pbar=False,
+            )
+
+            # Store reasoning details keyed by rubric criterion for cross-run comparison
+            for i, (rubric_item, kg_label) in enumerate(zip(rubric_items, kg_labels)):
+                criterion_key = f"criterion_{rubric_item.criterion[:50]}"  # Use truncated criterion as key
+                kg_reasoning_details[criterion_key] = {
+                    "kg_label": kg_label.get("kg_label"),
+                    "kg_reasoning": kg_label.get("kg_reasoning"),
+                    "contributed_nodes": [
+                        {"index": idx, "explanation": data.get("explanation")}
+                        for idx, data in node_contributions.items()
+                        if data.get("contributed")
+                    ]
+                }
+        else:
+            # For no_kg runs: label as None (not applicable)
+            kg_labels = [{"kg_label": None, "kg_reasoning": None}] * len(rubric_items)
+
+        return metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(row: dict):
@@ -460,12 +579,16 @@ class HealthBenchEval(Eval):
                 )
                 response_usage = response_dict.get("usage", None)
 
-            metrics, readable_explanation_str, rubric_items_with_grades = (
+            metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details = (
                 self.grade_sample(
                     prompt=actual_queried_prompt_messages,
                     response_text=response_text,
                     rubric_items=row["rubrics"],
                     example_tags=row["example_tags"],
+                    node_contributions=row.get("node_contributions"),
+                    node_summaries=row.get("node_summaries"),
+                    run_tag=row.get("run_tag", "no_kg"),
+                    validate_node_contributions=False,
                 )
             )
 
@@ -502,6 +625,8 @@ class HealthBenchEval(Eval):
                     "completion_id": hashlib.sha256(
                         (row["prompt_id"] + response_text).encode("utf-8")
                     ).hexdigest(),
+                    "kg_reasoning_details": kg_reasoning_details,
+                    "run_tag": row.get("run_tag", "no_kg"),
                 },
             )
 
