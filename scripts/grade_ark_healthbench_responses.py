@@ -286,10 +286,10 @@ def main():
             response_usage = sampler_response.response_metadata.get("usage", None)
             actual_queried_prompt_messages = sampler_response.actual_queried_message_list
 
-            # Extract KG-related fields from row (Phase 1 output)
-            node_contributions = row.get("node_contributions", {})
-            node_summaries = row.get("node_summaries", [])
-            run_tag = row.get("run_tag", "no_kg")
+            # Extract KG-related fields from sampler response (contains full Phase 1 output)
+            node_contributions = sampler_response.response_metadata.get("node_contributions", {})
+            node_summaries = sampler_response.response_metadata.get("node_summaries", [])
+            run_tag = sampler_response.response_metadata.get("run_tag", "no_kg")
 
             metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details = eval_obj.grade_sample(
                 prompt=actual_queried_prompt_messages,
@@ -331,7 +331,7 @@ def main():
                         (prompt_id + response_text).encode("utf-8")
                     ).hexdigest(),
                     "kg_reasoning_details": kg_reasoning_details,
-                    "run_tag": row.get("run_tag", "no_kg"),
+                    "run_tag": run_tag,
                 },
             )
             completed[i] = single_result
