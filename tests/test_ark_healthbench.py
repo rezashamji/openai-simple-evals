@@ -28,6 +28,9 @@ from healthbench.scripts.run_ark_on_healthbench import (
     load_id_to_result,
     parse_json_to_dict,
 )
+from healthbench.scripts.run_baseline_on_healthbench import (
+    reformat_to_phase1_schema,
+)
 
 
 def test_get_question_from_prompt():
@@ -155,6 +158,75 @@ def test_step2b_output_schema():
     assert isinstance(output_dict["run_tag"], str)
 
 
+def test_step3_reformat_to_phase1_schema():
+    """Step 3: Baseline runner reformats simple-evals output to Phase 1 schema."""
+    # Example from simple-evals (mock)
+    examples = [
+        {
+            "prompt_id": "q1",
+            "prompt": [{"role": "user", "content": "What is diabetes?"}],
+            "example_tags": ["medical"],
+        },
+        {
+            "prompt_id": "q2",
+            "prompt": [{"role": "user", "content": "How to treat fever?"}],
+            "example_tags": ["clinical"],
+        },
+    ]
+
+    # Simulated simple-evals output
+    simple_evals_results = {
+        "q1": {
+            "prompt_id": "q1",
+            "completion": [{"content": "Diabetes is a condition...", "role": "assistant"}],
+            "example_level_metadata": {
+                "rubric_items": [
+                    {"criterion": "Correctness", "grade": 1, "points": 5}
+                ],
+            },
+        },
+        "q2": {
+            "prompt_id": "q2",
+            "completion": [{"content": "Fever treatment includes...", "role": "assistant"}],
+            "example_level_metadata": {
+                "rubric_items": [
+                    {"criterion": "Accuracy", "grade": 1, "points": 5}
+                ],
+            },
+        },
+    }
+
+    # Reformat
+    phase1_results = reformat_to_phase1_schema(examples, simple_evals_results)
+
+    # Verify structure
+    assert len(phase1_results) == 2
+
+    # Check first result
+    assert phase1_results[0]["prompt_id"] == "q1"
+    assert phase1_results[0]["response_text"] == "Diabetes is a condition..."
+    assert phase1_results[0]["run_tag"] == "no_kg"
+    assert phase1_results[0]["node_summaries"] == []
+    assert phase1_results[0]["node_contributions"] == {}
+    assert phase1_results[0]["example_tags"] == ["medical"]
+
+    # Check second result
+    assert phase1_results[1]["prompt_id"] == "q2"
+    assert phase1_results[1]["response_text"] == "Fever treatment includes..."
+    assert phase1_results[1]["run_tag"] == "no_kg"
+
+    # Verify 8-field schema
+    expected_schema_fields = {
+        "prompt_id", "prompt", "response_text", "rubrics", "example_tags",
+        "node_summaries", "node_contributions", "run_tag"
+    }
+    for result in phase1_results:
+        assert set(result.keys()) == expected_schema_fields
+        assert isinstance(result["node_summaries"], list)
+        assert isinstance(result["node_contributions"], dict)
+        assert result["run_tag"] == "no_kg"
+
+
 def test_phase2_grade_with_mock_grader():
     """Phase 2 (HealthBench eval oracle) runs on a response jsonl; we use mock grader so no API."""
     try:
@@ -203,6 +275,7 @@ def run_all():
     test_resume_logic()
     test_parse_json_to_dict()
     test_step2b_output_schema()
+    test_step3_reformat_to_phase1_schema()
     test_phase2_grade_with_mock_grader()
     print("All tests passed.")
 
