@@ -85,35 +85,149 @@ def build_results_in_order(
     return results
 
 
-def nodes_to_nl(prompt: list, node_summaries: list, model_name: str = "azure/gpt-4.1") -> str:
-    """Turn ARK's node summaries + full HealthBench conversation into next-turn response.
-    Model sees full conversation + one user message with KG context and neutral instruction; model continues (answer, follow-up, etc.).
+def parse_json_to_dict(json_string: str) -> dict:
+    """Parse JSON string, handling markdown code blocks. Return dict or empty dict on failure."""
+    import json as json_lib
+    json_string = json_string.strip()
+    if json_string.startswith("```"):
+        json_string = json_string.split("```")[1].strip()
+        if json_string.startswith("json"):
+            json_string = json_string[4:].strip()
+    try:
+        return json_lib.loads(json_string)
+    except (json_lib.JSONDecodeError, ValueError):
+        return {}
+
+
+def nodes_to_nl(prompt: list, node_summaries: list, model_name: str = "azure/gpt-4.1") -> tuple[str, dict]:
+    """Turn ARK's node summaries + full HealthBench conversation into response + track node contributions.
+
+    Returns tuple of (response_text, node_contributions_dict) where:
+    - response_text: clean natural language response (no markup)
+    - node_contributions: dict mapping "node_<INDEX>" to {"explanation": str, "contributed": bool}
+
+    The model generates JSON with two fields:
+    1. final_answer: the clean response text
+    2. node_contributions: which nodes it claims to have used and why
+
     Uses LiteLLM + AZURE_* env (same as ARK)."""
     from litellm import completion
-    if not node_summaries:
-        return "I could not find relevant information in the knowledge base for this question."
-    blocks = [s.get("summary") or s.get("name") or f"(node {s.get('index', '')})" for s in node_summaries]
-    context = "\n\n".join(blocks)
-    kg_user_content = f"""The following is relevant information from the knowledge graph. Each paragraph (block of text separated by a blank line) is one item, ordered from most to least relevant to the question.
 
+    # Handle empty nodes case
+    if not node_summaries:
+        fallback = "I could not find relevant information in the knowledge base for this question."
+        return (fallback, {})
+
+    # Format nodes with their indices for the model to reference
+    node_blocks = []
+    for s in node_summaries:
+        idx = s.get("index", "?")
+        name = s.get("name", "")
+        summary = s.get("summary", "")
+        text = summary if summary else name
+        node_blocks.append(f"Node {idx}: {text}")
+
+    context = "\n\n".join(node_blocks)
+
+    # New prompt: ask for JSON with final_answer + node_contributions
+    kg_user_content = f"""You will answer a clinical health question using information from a knowledge graph (KG).
+
+# Conversation (multi-turn)
+[The conversation is provided above]
+
+# Retrieved KG Nodes (ordered most to least relevant)
 {context}
 
-Use it as appropriate to continue the conversation."""
+# Task
+1. Generate a clear, accurate response to the latest user question.
+2. After your response, reflect on which KG nodes you used and how.
+
+# Output Format
+Your response should be in this exact JSON format:
+
+{{
+  "final_answer": "Your clean natural language response here. Do not include any markup or citations.",
+  "node_contributions": {{
+    "node_<INDEX_A>": {{
+      "explanation": "This node provided information about X. I incorporated it into the answer as [specific text/reasoning].",
+      "contributed": true
+    }},
+    "node_<INDEX_B>": {{
+      "explanation": "This node discussed Y, but Y was not relevant to the question / I already knew this from context / the user already said this.",
+      "contributed": false
+    }}
+  }}
+}}
+
+Important:
+- For EVERY retrieved node, include an entry in node_contributions (even if contributed=false).
+- The "explanation" must be specific and grounded in the final_answer text.
+- Do not include markdown, citations, or node references in final_answer.
+- Return only valid JSON, no additional text."""
+
+    # Build messages with actual conversation + KG context
     messages = list(prompt) + [{"role": "user", "content": kg_user_content}]
+
     api_key = os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("AZURE_API_KEY")
     api_base = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get("AZURE_OPENAI_API_BASE") or os.environ.get("AZURE_API_BASE")
     api_version = os.environ.get("AZURE_OPENAI_API_VERSION") or os.environ.get("AZURE_API_VERSION")
-    response = completion(
-        model=model_name,
-        messages=messages,
-        max_tokens=1024,
-        timeout=30,
-        api_key=api_key,
-        api_base=api_base,
-        api_version=api_version,
-    )
-    content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-    return content.strip()
+
+    # Retry logic: retry if JSON is malformed or node_contributions is incomplete (per plan Step 2a)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = completion(
+                model=model_name,
+                messages=messages,
+                max_tokens=1024,
+                timeout=30,
+                api_key=api_key,
+                api_base=api_base,
+                api_version=api_version,
+            )
+            content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            parsed = parse_json_to_dict(content.strip())
+
+            # Validate that we got both required fields
+            if "final_answer" not in parsed or "node_contributions" not in parsed:
+                if attempt < max_retries - 1:
+                    print(f"Warning: JSON missing final_answer or node_contributions, retrying (attempt {attempt + 1}/{max_retries})...", file=sys.stderr)
+                    continue
+                else:
+                    # Fallback: return what we could parse
+                    response_text = parsed.get("final_answer", "")
+                    node_contributions = parsed.get("node_contributions", {})
+                    return (response_text, node_contributions)
+
+            response_text = parsed["final_answer"].strip()
+            node_contributions = parsed["node_contributions"]
+
+            # Validate node_contributions completeness using 60% threshold (per updated plan Step 2a)
+            expected_node_count = len(node_summaries)
+            actual_contrib_count = len(node_contributions)
+            completion_ratio = actual_contrib_count / expected_node_count if expected_node_count > 0 else 0
+
+            if completion_ratio < 0.6:
+                if attempt < max_retries - 1:
+                    print(f"Warning: node_contributions incomplete ({actual_contrib_count}/{expected_node_count} = {completion_ratio:.1%} < 60%), retrying (attempt {attempt + 1}/{max_retries})...", file=sys.stderr)
+                    continue
+                else:
+                    # Fallback: accept with poor tracking (will be reported in final stats)
+                    print(f"Warning: Accepting incomplete node_contributions ({actual_contrib_count}/{expected_node_count} = {completion_ratio:.1%}) after max retries", file=sys.stderr)
+                    return (response_text, node_contributions)
+
+            # Success: valid JSON with both fields and ≥60% completion
+            return (response_text, node_contributions)
+
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"Warning: nodes_to_nl() call failed (attempt {attempt + 1}/{max_retries}): {e}", file=sys.stderr)
+            else:
+                print(f"Error: nodes_to_nl() failed after {max_retries} attempts: {e}", file=sys.stderr)
+                return ("", {})
+
+    # Should not reach here, but fallback just in case
+    return ("", {})
 
 
 def main():
@@ -135,6 +249,12 @@ def main():
         choices=["full_conversation", "user_only"],
         default="full_conversation",
         help="What to send to ARK: full_conversation (default, conversation-aware retrieval) or user_only (user turns only, e.g. for ablations).",
+    )
+    parser.add_argument(
+        "--run-tag",
+        type=str,
+        default="kg_grounded",
+        help="Identifier for this run (e.g. 'kg_grounded', 'no_kg'). Saved to each output line.",
     )
     args = parser.parse_args()
 
@@ -196,24 +316,35 @@ def main():
             )
         finally:
             Path(q_file).unlink(missing_ok=True)
+        # Initialize defaults for failure cases
+        response_text = ""
+        node_summaries = []
+        node_contributions = {}
+
         if result.returncode != 0:
-            response_text = ""
+            pass  # Defaults remain empty
         else:
             try:
                 ark_out = json.loads(result.stdout.strip())
             except json.JSONDecodeError:
-                response_text = ""
+                pass  # Defaults remain empty
             else:
                 if ark_out.get("error"):
-                    response_text = ""
+                    pass  # Defaults remain empty
                 else:
-                    response_text = nodes_to_nl(prompt, ark_out.get("node_summaries", []), args.nl_model)
+                    # Extract node_summaries and call nodes_to_nl() which returns tuple
+                    node_summaries = ark_out.get("node_summaries", [])
+                    response_text, node_contributions = nodes_to_nl(prompt, node_summaries, args.nl_model)
+
         return (idx, {
             "prompt_id": prompt_id,
             "prompt": prompt,
             "response_text": response_text,
             "rubrics": rubrics,
             "example_tags": example_tags,
+            "node_summaries": node_summaries,
+            "node_contributions": node_contributions,
+            "run_tag": args.run_tag,
         })
 
     new_results: dict[int, dict] = {}
