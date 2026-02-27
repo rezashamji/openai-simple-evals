@@ -179,7 +179,7 @@ Important:
             response = completion(
                 model=model_name,
                 messages=messages,
-                max_tokens=1024,
+                max_tokens=2048,
                 timeout=30,
                 api_key=api_key,
                 api_base=api_base,
