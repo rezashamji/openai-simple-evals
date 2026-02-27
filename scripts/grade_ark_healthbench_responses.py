@@ -2,13 +2,11 @@
 Phase 2: Run HealthBench eval oracle. Input: response jsonl (one NL answer per example).
 Output: metrics (they grade on rubrics; we do not implement grading).
 
-Usage (from healthbench repo root):
-  python -m scripts.grade_ark_healthbench_responses \\
+Usage (from project root, i.e. parent of simple-evals/):
+  python -m simple_evals.scripts.grade_ark_healthbench_responses \\
     --responses-jsonl ark_healthbench_responses.jsonl \\
+    --output-dir output_dir/  \\
     [--examples 5]  # optional: must match number of lines in jsonl if set
-  # Or:
-  python scripts/grade_ark_healthbench_responses.py \\
-    --responses-jsonl ark_healthbench_responses.jsonl
 
 Prints overall score and saves report HTML + full results JSON.
 Supports --checkpoint for resumable grading after crashes.
@@ -27,23 +25,20 @@ from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-# Import from root of simple-evals repo (all files at root level, not in healthbench/ package)
-repo_root = Path(__file__).resolve().parent.parent  # .../simple-evals
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
-
-import common  # type: ignore
-import healthbench_eval  # type: ignore
-from healthbench_eval import (  # type: ignore
+# Import from simple-evals package using relative imports
+# Run as: python -m simple_evals.scripts.grade_ark_healthbench_responses
+from .. import common  # type: ignore
+from .. import healthbench_eval  # type: ignore
+from ..healthbench_eval import (  # type: ignore
     HEALTHBENCH_HTML_JINJA,
     HealthBenchEval,
     _aggregate_get_clipped_mean,
     get_usage_dict,
 )
-from sampler.precomputed_response_sampler import (  # type: ignore
+from ..sampler.precomputed_response_sampler import (  # type: ignore
     PrecomputedResponseSampler,
 )
-from types import MessageList, SamplerResponse, SingleEvalResult  # type: ignore
+from ..types import MessageList, SamplerResponse, SingleEvalResult  # type: ignore
 
 # Avoid importing OpenAI SDK just to get this constant.
 OPENAI_SYSTEM_MESSAGE_API = "You are a helpful assistant."
@@ -231,6 +226,7 @@ def main():
         num_examples = num_responses
 
     # --- Force HealthBenchEval to use the local eval jsonl (no network) ---
+    repo_root = Path(__file__).resolve().parent.parent  # .../simple-evals
     local_eval_jsonl = repo_root / "2025-05-07-06-14-12_oss_eval.jsonl"
     if local_eval_jsonl.exists():
         # HealthBenchEval reads from module-level INPUT_PATH; blobfile can read local paths too.
