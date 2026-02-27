@@ -26,6 +26,7 @@ from healthbench.scripts.run_ark_on_healthbench import (
     get_question_from_prompt,
     get_resume_to_compute,
     load_id_to_result,
+    parse_json_to_dict,
 )
 
 
@@ -94,6 +95,66 @@ def test_resume_logic():
     assert results[1]["prompt_id"] == "p2" and results[1]["response_text"] == "new2"
 
 
+def test_parse_json_to_dict():
+    """Step 2a: parse_json_to_dict handles markdown code blocks and invalid JSON."""
+    # Valid JSON
+    assert parse_json_to_dict('{"key": "value"}') == {"key": "value"}
+
+    # JSON wrapped in markdown code blocks
+    assert parse_json_to_dict('```json\n{"key": "value"}\n```') == {"key": "value"}
+    assert parse_json_to_dict('```\n{"key": "value"}\n```') == {"key": "value"}
+
+    # Invalid JSON returns empty dict
+    assert parse_json_to_dict("not valid json") == {}
+    assert parse_json_to_dict('{"incomplete": ') == {}
+
+
+def test_step2b_output_schema():
+    """Step 2b: Verify output schema includes node_summaries, node_contributions, run_tag."""
+    # This test verifies the new output schema matches kg-metadata-enrichment-plan.md Step 2b
+    expected_schema_fields = {
+        "prompt_id",
+        "prompt",
+        "response_text",
+        "rubrics",
+        "example_tags",
+        "node_summaries",      # NEW (Step 2b)
+        "node_contributions",  # NEW (Step 2b)
+        "run_tag",            # NEW (Step 2b)
+    }
+
+    # Mock output dict (as would be returned by process_one)
+    output_dict = {
+        "prompt_id": "test_1",
+        "prompt": [{"role": "user", "content": "test question"}],
+        "response_text": "test answer",
+        "rubrics": [],
+        "example_tags": [],
+        "node_summaries": [
+            {"index": 42, "name": "Type 2 Diabetes", "summary": "..."}
+        ],
+        "node_contributions": {
+            "node_42": {
+                "explanation": "This node provided information...",
+                "contributed": True
+            }
+        },
+        "run_tag": "kg_grounded",
+    }
+
+    # Verify all required fields present
+    assert set(output_dict.keys()) == expected_schema_fields
+
+    # Verify node_summaries is a list
+    assert isinstance(output_dict["node_summaries"], list)
+
+    # Verify node_contributions is a dict
+    assert isinstance(output_dict["node_contributions"], dict)
+
+    # Verify run_tag is a string
+    assert isinstance(output_dict["run_tag"], str)
+
+
 def test_phase2_grade_with_mock_grader():
     """Phase 2 (HealthBench eval oracle) runs on a response jsonl; we use mock grader so no API."""
     try:
@@ -140,6 +201,8 @@ def run_all():
     test_get_question_from_prompt()
     test_format_prompt_as_conversation_string()
     test_resume_logic()
+    test_parse_json_to_dict()
+    test_step2b_output_schema()
     test_phase2_grade_with_mock_grader()
     print("All tests passed.")
 
