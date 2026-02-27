@@ -54,10 +54,12 @@ class PrecomputedResponseSampler(SamplerBase):
             )
         row = self._responses[i]
         response_text = row.get("response_text", "")
+        # Expose all row data (node_contributions, run_tag, etc.) via response_metadata
+        response_metadata = {k: v for k, v in row.items() if k != "response_text"}
         return SamplerResponse(
             response_text=response_text,
             actual_queried_message_list=message_list,
-            response_metadata={},
+            response_metadata=response_metadata,
         )
 
     def __call__(self, message_list: MessageList) -> SamplerResponse:
@@ -73,9 +75,11 @@ class PrecomputedResponseSampler(SamplerBase):
         row = self._responses[self._index]
         self._index += 1
         response_text = row.get("response_text", "")
+        # Expose all row data (node_contributions, run_tag, etc.) via response_metadata
+        response_metadata = {k: v for k, v in row.items() if k != "response_text"}
         return SamplerResponse(
             response_text=response_text,
             actual_queried_message_list=message_list,
-            response_metadata={},
+            response_metadata=response_metadata,
         )
 
