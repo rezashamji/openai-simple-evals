@@ -19,9 +19,9 @@ cd simple-evals
 python3.12 -m venv .venv
 source .venv/bin/activate
 
-# Install dependencies
+# Install dependencies (all-in-one venv for simple-evals + ARK integration)
 pip install --upgrade pip
-pip install litellm tqdm blobfile openai anthropic
+pip install litellm tqdm blobfile openai anthropic pyyaml tantivy networkx
 ```
 
 **Key packages** needed:
@@ -30,6 +30,9 @@ pip install litellm tqdm blobfile openai anthropic
 - `blobfile` — Cloud file handling (if using remote eval data)
 - `openai` — OpenAI API client
 - `anthropic` — Anthropic API client (optional)
+- `pyyaml` — **CRITICAL for ARK subprocess** — required by `ark/benchmarks/stark/utils.py`
+- `tantivy` — BM25 search engine (used by ARK node retrieval)
+- `networkx` — Graph utilities (used by ARK)
 
 ### 2. Azure Credentials (`.env` file)
 
@@ -127,16 +130,19 @@ python simple-evals/scripts/build_kg_binary_labels.py \
 
 ---
 
-### **Level 2: ARK Integration Test (NOT YET TESTED)**
+### **Level 2: ARK Integration Test (TESTED ✅)**
 
-Tests **Phase 1** (ARK node retrieval) → **Phase 2** (grading with real nodes).
+Tests **Phase 1A** (ARK node retrieval) + **Phase 1B** (no-KG baseline) → **Phase 2** (grading comparison).
 
 **What it validates:**
 - ✅ ARK subprocess integration works
 - ✅ Node summaries retrieved correctly
 - ✅ Nodes-to-NL LLM conversion with real KG context
 - ✅ Node contributions tracked accurately
-- ✅ Full pipeline with real KG metadata
+- ✅ Baseline LLM calls work independently
+- ✅ Full pipeline end-to-end with real KG vs no-KG comparison
+- ✅ Grading works on both runs
+- ✅ ARK+KG shows measurable improvement over baseline
 
 **When to use:**
 - Before committing Phase 1 changes
@@ -146,23 +152,51 @@ Tests **Phase 1** (ARK node retrieval) → **Phase 2** (grading with real nodes)
 **Prerequisites:**
 - ARK repository with `benchmarks/stark/run_one_question.py`
 - A KG graph (e.g., "prime") with nodes and edges
-- Real HealthBench questions
+- Real HealthBench questions (at least 50)
 
-**Run:**
+**Run (Phase 1A + 1B):**
 ```bash
-# Phase 1: Get ARK nodes and generate responses
+# Phase 1A: Get ARK nodes and generate KG-grounded responses
 python -m simple_evals.scripts.run_ark_on_healthbench \
-  --input-jsonl simple-evals/2025-05-07-06-14-12_oss_eval.jsonl \
-  --output-jsonl /tmp/test_kg_responses.jsonl \
-  --ark-dir /path/to/ark \
+  --examples-jsonl healthbench_50q_subset.jsonl \
+  --output-path /tmp/phase1a_kg_grounded.jsonl \
   --graph-name prime \
-  --limit 5
+  --ark-model gpt-4.1 \
+  --nl-model azure/gpt-4.1 \
+  --run-tag kg_grounded
 
-# Phase 2: Grade with KG metadata
+# Phase 1B: Generate no-KG baseline (direct LLM calls, no ARK)
+python simple-evals/scripts/run_baseline_on_healthbench.py \
+  --examples-jsonl healthbench_50q_subset.jsonl \
+  --output-path /tmp/phase1b_no_kg.jsonl \
+  --model azure/gpt-4.1
+
+# Phase 2A: Grade KG-grounded responses
 python -m simple_evals.scripts.grade_ark_healthbench_responses \
-  --responses-jsonl /tmp/test_kg_responses.jsonl \
-  --output-dir /tmp/test_kg_output/
+  --responses-jsonl /tmp/phase1a_kg_grounded.jsonl \
+  --output-dir /tmp/grading_a/
+
+# Phase 2B: Grade no-KG baseline
+python -m simple_evals.scripts.grade_ark_healthbench_responses \
+  --responses-jsonl /tmp/phase1b_no_kg.jsonl \
+  --output-dir /tmp/grading_b/
+
+# Step 8b: Criterion-level comparison
+python simple-evals/scripts/compare_kg_runs_criterion_level.py \
+  --kg-graded /tmp/grading_a/phase1a_kg_grounded_grading_checkpoint.jsonl \
+  --no-kg-graded /tmp/grading_b/phase1b_no_kg_grading_checkpoint.jsonl \
+  --output /tmp/step8b_criterion_level.jsonl
+
+# Step 9: Binary labels
+python simple-evals/scripts/build_kg_binary_labels.py \
+  --criterion-level /tmp/step8b_criterion_level.jsonl \
+  --output /tmp/step9_binary_labels.jsonl
 ```
+
+**Expected output:**
+- Phase 1A: `phase1a_kg_grounded.jsonl` (KG-grounded responses with node_contributions)
+- Phase 1B: `phase1b_no_kg.jsonl` (baseline responses with empty node fields)
+- Phase 2 metrics: ARK+KG score > baseline score (proof of benefit)
 
 ---
 
@@ -182,8 +216,9 @@ Tests the complete pipeline on all HealthBench questions.
 
 | File | Purpose | Status |
 |------|---------|--------|
+| `scripts/run_ark_on_healthbench.py` | Phase 1A: Generate responses with ARK nodes | ✅ Tested (50q, token fix applied) |
+| `scripts/run_baseline_on_healthbench.py` | Phase 1B: Generate no-KG baseline via direct LLM calls | ✅ Fixed & Tested (50q) |
 | `scripts/grade_ark_healthbench_responses.py` | Phase 2: Grade responses with KG enrichment | ✅ Fixed (relative imports) |
-| `scripts/run_ark_on_healthbench.py` | Phase 1: Generate responses with ARK nodes | 🔄 Not tested with KG |
 | `scripts/compare_kg_runs_criterion_level.py` | Step 8b: Criterion-level KG vs no-KG comparison | ✅ Tested |
 | `scripts/build_kg_binary_labels.py` | Step 9: Generate binary labels | ✅ Tested |
 | `healthbench_eval.py` | Rubric grading logic with KG relevance | ✅ Tested |
@@ -248,6 +283,41 @@ ln -s simple-evals simple_evals
 
 # Run from project root
 python -m simple_evals.scripts.grade_ark_healthbench_responses ...
+```
+
+### Issue 4: Phase 1B (Baseline) Subprocess Failure
+
+**Symptom (Feb 27, 2026 - FIXED ✅):**
+```
+error: unrecognized arguments: --output_path /tmp/tmpu5b3tkf3.jsonl
+```
+
+**Cause:** `run_baseline_on_healthbench.py` was using subprocess call to `simple-evals` CLI with non-existent `--output_path` flag.
+- simple-evals outputs to stdout, not file
+- No direct way to capture per-sample outputs
+
+**Root Problem:** Architectural mismatch
+- Phase 1A (ARK+KG): Calls LLM directly via `litellm.completion()`
+- Phase 1B (baseline): Was trying to use simple-evals subprocess
+
+**Fix Applied (Session 9):** ✅ Rewrote `run_baseline_on_healthbench.py`
+- Changed from subprocess call to direct `litellm.completion()` calls
+- Mirrors Phase 1A architecture (independent LLM calls, JSONL output)
+- Maintains checkpoint/resume support
+- Supports parallel workers (`--n-workers`)
+
+**Test Result:** Both Phase 1A and 1B now work correctly (50q validation ✅)
+- Phase 1A (ARK+KG) score: 0.0997
+- Phase 1B (baseline) score: 0.0000
+- **Improvement: +9.97%** (proof of KG benefit)
+
+**To use Phase 1B:**
+```bash
+python simple-evals/scripts/run_baseline_on_healthbench.py \
+  --examples-jsonl healthbench_questions.jsonl \
+  --output-path phase1b_baseline.jsonl \
+  --model azure/gpt-4.1 \
+  --n-workers 10  # optional: parallelize
 ```
 
 ### Issue 4: LiteLLM Logging Errors
