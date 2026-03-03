@@ -99,15 +99,16 @@ def process_criterion_level_file(
             # Count KG labels
             kg_label_counts = count_kg_labels(criterion_level_data)
 
-            # Extract kg_name from criterion-level data (passed through from Phase 1)
+            # Extract kg_name and llm_model from criterion-level data (passed through from Phase 1)
             kg_name = item.get("kg_name", "unknown")
+            llm_model = item.get("llm_model", "unknown")
 
             # Build output item
             output_item = {
                 "prompt_id": prompt_id,
                 "benchmark": "healthbench",
                 "kg_name": kg_name,
-                "llm_model": "gpt-4-turbo",  # TODO: extract from metadata
+                "llm_model": llm_model,
 
                 # Question-level scores
                 "kg_score": kg_score,

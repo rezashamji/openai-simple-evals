@@ -346,6 +346,7 @@ def main():
             "node_contributions": node_contributions,
             "run_tag": args.run_tag,
             "kg_name": args.graph_name,
+            "llm_model": args.nl_model,
         })
 
     new_results: dict[int, dict] = {}

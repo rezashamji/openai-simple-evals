@@ -257,6 +257,7 @@ def main():
         output_item = {
             "prompt_id": prompt_id,
             "kg_name": kg_result.get("kg_name", "unknown"),  # Passed through from Phase 1
+            "llm_model": kg_result.get("llm_model", "unknown"),  # Passed through from Phase 1
             "kg_score": kg_result.get("score"),
             "nonkg_score": nonkg_result.get("score"),
             "score_delta": (kg_result.get("score", 0) - nonkg_result.get("score", 0)),
