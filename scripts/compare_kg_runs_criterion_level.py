@@ -31,17 +31,19 @@ def assign_criterion_bucket(
     kg_criteria_met: bool,
     nonkg_criteria_met: bool,
     kg_label: Optional[str],
+    contributed_nodes: Optional[list] = None,
 ) -> str:
     """
-    Assign a criterion to one of 6 buckets based on outcomes and KG label.
+    Assign a criterion to one of 7 buckets based on outcomes, KG label, and node contributions.
 
     Args:
         kg_criteria_met: Whether KG-grounded run met this criterion
         nonkg_criteria_met: Whether non-KG baseline met this criterion
         kg_label: KG label from grader ("kg_helped", "kg_hurt", "kg_neutral")
+        contributed_nodes: List of nodes LLM actually used for this criterion (from kg_reasoning_details)
 
     Returns:
-        Bucket name: "both_correct", "kg_necessary", "kg_lucky", "kg_resilient", "kg_hurt", "both_failed"
+        Bucket name: "both_correct", "kg_necessary", "kg_lucky", "kg_resilient", "kg_hurt", "llm_hurt", "both_failed"
     """
     if kg_criteria_met and nonkg_criteria_met:
         return "both_correct"
@@ -56,7 +58,11 @@ def assign_criterion_bucket(
             # Fallback for unexpected label
             return "kg_lucky"
     elif not kg_criteria_met and nonkg_criteria_met:
-        return "kg_hurt"
+        # Distinguish TRUE kg_hurt (nodes used) from llm_hurt (nodes not used)
+        if contributed_nodes and len(contributed_nodes) > 0:
+            return "kg_hurt"  # TRUE kg_hurt: nodes were used but caused wrong answer
+        else:
+            return "llm_hurt"  # LLM hurt: nodes available but not used
     else:  # not kg_criteria_met and not nonkg_criteria_met
         return "both_failed"
 
@@ -69,6 +75,7 @@ def get_bucket_signal_value(bucket: str) -> str:
         "kg_lucky": "suspicious",
         "kg_resilient": "edge_case",
         "kg_hurt": "high",
+        "llm_hurt": "medium",
         "both_failed": "neutral",
     }
     return signal_map.get(bucket, "unknown")
@@ -81,7 +88,8 @@ def get_bucket_reason(bucket: str, kg_label: Optional[str] = None) -> str:
         "kg_necessary": "KG-grounded met criterion, baseline didn't, KG label confirms help",
         "kg_lucky": "KG-grounded met criterion, baseline didn't, but KG label is neutral (suspicious)",
         "kg_resilient": "KG-grounded met criterion, baseline didn't, but KG label says hurt (edge case)",
-        "kg_hurt": "Baseline met criterion, KG-grounded didn't (KG harmful)",
+        "kg_hurt": "Baseline met criterion, KG-grounded didn't, and KG nodes were used (true KG failure)",
+        "llm_hurt": "Baseline met criterion, KG-grounded didn't, but KG nodes were not used (LLM reasoning failure)",
         "both_failed": "Neither run met criterion",
     }
     return reasons.get(bucket, "Unknown")
@@ -106,7 +114,7 @@ def extract_criteria_data(single_result: dict[str, Any]) -> list[dict[str, Any]]
     Extract criterion data from a single eval result.
 
     Returns list of dicts with keys:
-      - criterion, points, criteria_met, kg_label, explanation, kg_explanation, kg_reasoning
+      - criterion, points, criteria_met, explanation
     """
     example_metadata = single_result.get("example_level_metadata", {})
     rubric_items = example_metadata.get("rubric_items", [])
@@ -117,9 +125,6 @@ def extract_criteria_data(single_result: dict[str, Any]) -> list[dict[str, Any]]
             "criterion": item.get("criterion", ""),
             "points": item.get("points", 0),
             "criteria_met": item.get("criteria_met", False),
-            "kg_label": item.get("kg_label"),  # Only in kg_grounded run
-            "kg_explanation": item.get("kg_explanation"),
-            "kg_reasoning": item.get("kg_reasoning"),
             "explanation": item.get("explanation", ""),
         })
 
@@ -138,18 +143,36 @@ def compare_runs(
     kg_criteria = extract_criteria_data(kg_result)
     nonkg_criteria = extract_criteria_data(nonkg_result)
 
+    # Extract kg_reasoning_details from Phase 2 grading output (contains kg_label and contributed_nodes)
+    kg_reasoning_details = kg_result.get("example_level_metadata", {}).get("kg_reasoning_details", {})
+
     # Assume same number of criteria in same order
     comparisons = []
     for idx, (kg_crit, nonkg_crit) in enumerate(zip(kg_criteria, nonkg_criteria)):
         kg_met = kg_crit["criteria_met"]
         nonkg_met = nonkg_crit["criteria_met"]
-        kg_label = kg_crit.get("kg_label")
+        criterion_text = kg_crit["criterion"]
 
-        bucket = assign_criterion_bucket(kg_met, nonkg_met, kg_label)
+        # Extract kg_label and contributed_nodes from kg_reasoning_details
+        # Keys in kg_reasoning_details are truncated criterion text (first 50 chars)
+        kg_label = None
+        kg_reasoning = None
+        contributed_nodes = []
+
+        for key in kg_reasoning_details.keys():
+            # Match by checking if criterion text starts with the key (removing "criterion_" prefix)
+            key_criterion = key.replace("criterion_", "")
+            if criterion_text.startswith(key_criterion):
+                kg_label = kg_reasoning_details[key].get("kg_label")
+                kg_reasoning = kg_reasoning_details[key].get("kg_reasoning")
+                contributed_nodes = kg_reasoning_details[key].get("contributed_nodes", [])
+                break
+
+        bucket = assign_criterion_bucket(kg_met, nonkg_met, kg_label, contributed_nodes)
 
         comparison = {
             "criterion_idx": idx,
-            "criterion_text": kg_crit["criterion"],
+            "criterion_text": criterion_text,
             "points": kg_crit["points"],
 
             # Outcomes
@@ -160,7 +183,8 @@ def compare_runs(
             # KG-grounded run details
             "kg_explanation": kg_crit.get("explanation", ""),
             "kg_label": kg_label,
-            "kg_reasoning": kg_crit.get("kg_reasoning"),
+            "kg_reasoning": kg_reasoning,
+            "contributed_nodes": contributed_nodes,  # For debugging/verification
 
             # Non-KG run details
             "nonkg_explanation": nonkg_crit.get("explanation", ""),
@@ -186,7 +210,7 @@ def count_bucket_distribution(comparisons: list[dict[str, Any]]) -> dict[str, in
         distribution[bucket] += 1
 
     # Ensure all buckets are present
-    all_buckets = ["both_correct", "kg_necessary", "kg_lucky", "kg_resilient", "kg_hurt", "both_failed"]
+    all_buckets = ["both_correct", "kg_necessary", "kg_lucky", "kg_resilient", "kg_hurt", "llm_hurt", "both_failed"]
     for bucket in all_buckets:
         if bucket not in distribution:
             distribution[bucket] = 0
@@ -277,7 +301,7 @@ def main():
     print("\n=== Criterion-Level Summary ===", file=sys.stderr)
     print(f"Total criteria analyzed: {sum(total_buckets.values())}", file=sys.stderr)
     print("Bucket distribution:", file=sys.stderr)
-    for bucket in ["both_correct", "kg_necessary", "kg_lucky", "kg_resilient", "kg_hurt", "both_failed"]:
+    for bucket in ["both_correct", "kg_necessary", "kg_lucky", "kg_resilient", "kg_hurt", "llm_hurt", "both_failed"]:
         count = total_buckets[bucket]
         pct = 100 * count / sum(total_buckets.values()) if sum(total_buckets.values()) > 0 else 0
         print(f"  {bucket}: {count} ({pct:.1f}%)", file=sys.stderr)
