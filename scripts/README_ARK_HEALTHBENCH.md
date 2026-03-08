@@ -82,10 +82,14 @@ python -m healthbench.scripts.run_ark_on_healthbench \
 # --graph-name prime --ark-model azure/gpt-4.1 --ark-agents 3 --ark-max-steps 20
 # Optional: parallel questions (default 1) --n-workers 8
 # Optional: --ark-input user_only to send only user turns to ARK (default: full_conversation)
+# Optional: logging progress every N questions (default 10, set to 0 to disable)
+# --log-interval 10
 
 # Phase 2: response jsonl → HealthBench eval → metrics
 python -m healthbench.scripts.grade_ark_healthbench_responses --responses-jsonl healthbench/responses.jsonl
 # Optional: --n-threads 200 (default 120) --output-dir /path/to/dir
+# Optional: logging progress every N questions (default 10, set to 0 to disable)
+# --log-interval 10
 ```
 
 **Full run on Slurm:** Submit `run_ark_healthbench_full.slurm` from the repo root. The script loads `module load python/3.12.11-fasrc02`. Edit the variables at the top (paths, `GRAPH_NAME`, `ARK_MODEL`, `N_WORKERS`, `N_THREADS`, optional `LIMIT`).

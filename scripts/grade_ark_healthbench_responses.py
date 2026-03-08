@@ -23,6 +23,57 @@ from pathlib import Path
 
 from tqdm import tqdm
 
+
+def tail_jsonl(filepath, n=1):
+    """Read last n lines from a JSONL file."""
+    try:
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+        return [json.loads(line) for line in lines[-n:] if line.strip()]
+    except Exception:
+        return []
+
+
+def log_grading_progress(graded_jsonl, question_num, log_interval=10):
+    """Log grading progress with sample KG reasoning details."""
+    lines = tail_jsonl(graded_jsonl, n=1)
+    if not lines:
+        return
+
+    latest = lines[0]
+    score = latest.get('score', 'N/A')
+    kg_rel = latest.get('metrics', {}).get('kg_relevance_score', 'N/A')
+
+    print(f"\n{'='*80}")
+    print(f"[Grading Progress] {question_num} questions graded")
+    print(f"{'='*80}")
+    print(f"Latest question score: {score}")
+    print(f"KG relevance score: {kg_rel}")
+
+    # Show KG reasoning details if available
+    example_meta = latest.get('example_level_metadata', {})
+    kg_reasoning = example_meta.get('kg_reasoning_details', {})
+
+    if kg_reasoning:
+        print(f"\nKG Reasoning Details (first 3 criteria):")
+        for i, (criterion, reasoning) in enumerate(list(kg_reasoning.items())[:3]):
+            kg_label = reasoning.get('kg_label', 'N/A')
+            kg_reasoning_text = reasoning.get('kg_reasoning', '')[:150]
+            print(f"\n  Criterion {i+1}: {criterion[:70]}...")
+            print(f"    Label: {kg_label}")
+            print(f"    Reasoning: {kg_reasoning_text}...")
+    else:
+        print(f"\nNo KG reasoning details (baseline run or no nodes)")
+
+    # Show rubric items summary
+    rubric_items = example_meta.get('rubric_items', [])
+    if rubric_items:
+        correct = sum(1 for r in rubric_items if r.get('criteria_met'))
+        total = len(rubric_items)
+        print(f"\nRubric Summary: {correct}/{total} criteria met")
+
+    sys.stdout.flush()
+
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 # Import from simple-evals package using relative imports
@@ -207,6 +258,12 @@ def main():
         default=False,
         help="Enable cross-checking of node contribution claims against raw node summaries (KG enrichment).",
     )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=10,
+        help="Log progress every N questions (default: 10, set to 0 to disable logging).",
+    )
     args = parser.parse_args()
 
     response_path = Path(args.responses_jsonl)
@@ -272,6 +329,7 @@ def main():
     # --- Grade loop with checkpoint: process each example, skip cached, handle content-filter ---
     examples = eval_obj.examples
     skipped_content_filter = 0
+    log_interval = max(0, args.log_interval)  # 0 disables logging
     print("Running HealthBench grading on precomputed responses...", file=sys.stderr)
     for i in tqdm(range(len(examples)), desc="Grading"):
         if i in completed:
@@ -332,12 +390,22 @@ def main():
                     ).hexdigest(),
                     "kg_reasoning_details": kg_reasoning_details,
                     "run_tag": run_tag,
+                    # Issue #2.5: Preserve node data from Phase 1 for Part 3 (node+criterion labeling)
+                    "node_summaries": node_summaries,
+                    "node_contributions": node_contributions,
                 },
             )
             completed[i] = single_result
             # Append to checkpoint after each successful grade
             with open(checkpoint_path, "a", encoding="utf-8") as cf:
                 cf.write(json.dumps(_single_result_to_checkpoint_dict(i, single_result)) + "\n")
+
+            # Log progress if logging enabled
+            if log_interval > 0 and (i + 1) % log_interval == 0:
+                try:
+                    log_grading_progress(str(checkpoint_path), i + 1, log_interval)
+                except Exception:
+                    pass  # Don't fail if logging fails
         except ContentFilterSkipError as e:
             skipped_content_filter += 1
             logging.warning("Content filter skip index=%d prompt_id=%s: %s", i, prompt_id, e)

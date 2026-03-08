@@ -34,10 +34,106 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+
+def tail_jsonl(filepath, n=1):
+    """Read last n lines from a JSONL file."""
+    try:
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+        return [json.loads(line) for line in lines[-n:] if line.strip()]
+    except Exception:
+        return []
+
+
+def format_node_summary(node):
+    """Format a single node for display."""
+    return {
+        'index': node.get('index'),
+        'name': node.get('name', '')[:60],
+        'summary': node.get('summary', '')[:100]
+    }
+
+
+def log_phase1_progress(output_jsonl, question_num, log_interval=10):
+    """Log Phase 1A progress with sample nodes and contributions."""
+    lines = tail_jsonl(output_jsonl, n=1)
+    if not lines:
+        return
+
+    latest = lines[0]
+    prompt_id = latest.get('prompt_id', 'N/A')[:8]
+    has_nodes = len(latest.get('node_summaries', [])) > 0
+    node_count = len(latest.get('node_summaries', []))
+    contrib_count = len(latest.get('node_contributions', {}))
+    response_len = len(latest.get('response_text', ''))
+
+    print(f"\n{'='*80}")
+    print(f"[Phase 1A Progress] {question_num} questions processed")
+    print(f"{'='*80}")
+    print(f"Latest question: {prompt_id}...")
+    print(f"  Nodes found: {node_count}")
+    print(f"  Nodes used (contributions): {contrib_count}")
+    print(f"  Response length: {response_len} chars")
+
+    if has_nodes and node_count > 0:
+        nodes = latest.get('node_summaries', [])
+        print(f"\n  Sample nodes (first 3 of {node_count}):")
+        for node in nodes[:3]:
+            formatted = format_node_summary(node)
+            print(f"    - {formatted['name']}")
+            print(f"      Summary: {formatted['summary']}")
+
+    if contrib_count > 0:
+        contribs = latest.get('node_contributions', {})
+        print(f"\n  Sample node contributions (first 2 of {contrib_count}):")
+        for node_id, contrib_data in list(contribs.items())[:2]:
+            contributed = contrib_data.get('contributed', False)
+            explanation = contrib_data.get('explanation', '')[:100]
+            print(f"    - {node_id}: contributed={contributed}")
+            print(f"      Explanation: {explanation}...")
+    else:
+        print(f"\n  No node contributions (empty response or no nodes)")
+
+    sys.stdout.flush()
+
 def get_question_from_prompt(prompt: list) -> str:
     """Extract user content from HealthBench prompt (list of message dicts). Same order as eval. Optional for ARK via --ark-input user_only."""
     parts = [m["content"] for m in prompt if m.get("role") == "user"]
     return "\n\n".join(parts).strip() if parts else ""
+
+
+def normalize_node_indices(node_summaries: list, node_contributions: dict) -> tuple[list, dict]:
+    """Normalize node indices to string format for consistency.
+
+    node_summaries uses integer indices (e.g., 128100)
+    node_contributions uses string keys (e.g., "node_128100")
+
+    This function:
+    1. Converts all node_summaries indices from int to string
+    2. Ensures node_contributions keys match the string format
+    3. Returns normalized (node_summaries, node_contributions) tuple
+
+    This ensures downstream code has consistent index types.
+    """
+    # Normalize node_summaries: convert index to string
+    normalized_summaries = []
+    for node in node_summaries:
+        normalized_node = node.copy()
+        if "index" in node:
+            normalized_node["index"] = str(node["index"])
+        normalized_summaries.append(normalized_node)
+
+    # Normalize node_contributions: ensure all keys are "node_<INDEX>" format
+    normalized_contributions = {}
+    for key, value in node_contributions.items():
+        # Handle both formats: "node_128100" and "128100"
+        if isinstance(key, str) and key.startswith("node_"):
+            normalized_key = key
+        else:
+            normalized_key = f"node_{key}"
+        normalized_contributions[normalized_key] = value
+
+    return normalized_summaries, normalized_contributions
 
 
 def format_prompt_as_conversation_string(prompt: list) -> str:
@@ -83,20 +179,6 @@ def build_results_in_order(
         else:
             results.append(new_results[i])
     return results
-
-
-def parse_json_to_dict(json_string: str) -> dict:
-    """Parse JSON string, handling markdown code blocks. Return dict or empty dict on failure."""
-    import json as json_lib
-    json_string = json_string.strip()
-    if json_string.startswith("```"):
-        json_string = json_string.split("```")[1].strip()
-        if json_string.startswith("json"):
-            json_string = json_string[4:].strip()
-    try:
-        return json_lib.loads(json_string)
-    except (json_lib.JSONDecodeError, ValueError):
-        return {}
 
 
 def nodes_to_nl(prompt: list, node_summaries: list, model_name: str = "azure/gpt-4.1") -> tuple[str, dict]:
@@ -172,62 +254,23 @@ Important:
     api_base = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get("AZURE_OPENAI_API_BASE") or os.environ.get("AZURE_API_BASE")
     api_version = os.environ.get("AZURE_OPENAI_API_VERSION") or os.environ.get("AZURE_API_VERSION")
 
-    # Retry logic: retry if JSON is malformed or node_contributions is incomplete (per plan Step 2a)
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = completion(
-                model=model_name,
-                messages=messages,
-                max_tokens=2048,
-                timeout=30,
-                api_key=api_key,
-                api_base=api_base,
-                api_version=api_version,
-            )
-            content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-            parsed = parse_json_to_dict(content.strip())
+    response = completion(
+        model=model_name,
+        messages=messages,
+        response_format={"type": "json_object"},
+        max_tokens=2048,
+        timeout=30,
+        api_key=api_key,
+        api_base=api_base,
+        api_version=api_version,
+    )
+    content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    parsed = json.loads(content.strip())
 
-            # Validate that we got both required fields
-            if "final_answer" not in parsed or "node_contributions" not in parsed:
-                if attempt < max_retries - 1:
-                    print(f"Warning: JSON missing final_answer or node_contributions, retrying (attempt {attempt + 1}/{max_retries})...", file=sys.stderr)
-                    continue
-                else:
-                    # Fallback: return what we could parse
-                    response_text = parsed.get("final_answer", "")
-                    node_contributions = parsed.get("node_contributions", {})
-                    return (response_text, node_contributions)
+    response_text = parsed.get("final_answer", "").strip()
+    node_contributions = parsed.get("node_contributions", {})
 
-            response_text = parsed["final_answer"].strip()
-            node_contributions = parsed["node_contributions"]
-
-            # Validate node_contributions completeness using 60% threshold (per updated plan Step 2a)
-            expected_node_count = len(node_summaries)
-            actual_contrib_count = len(node_contributions)
-            completion_ratio = actual_contrib_count / expected_node_count if expected_node_count > 0 else 0
-
-            if completion_ratio < 0.6:
-                if attempt < max_retries - 1:
-                    print(f"Warning: node_contributions incomplete ({actual_contrib_count}/{expected_node_count} = {completion_ratio:.1%} < 60%), retrying (attempt {attempt + 1}/{max_retries})...", file=sys.stderr)
-                    continue
-                else:
-                    # Fallback: accept with poor tracking (will be reported in final stats)
-                    print(f"Warning: Accepting incomplete node_contributions ({actual_contrib_count}/{expected_node_count} = {completion_ratio:.1%}) after max retries", file=sys.stderr)
-                    return (response_text, node_contributions)
-
-            # Success: valid JSON with both fields and ≥60% completion
-            return (response_text, node_contributions)
-
-        except Exception as e:
-            if attempt < max_retries - 1:
-                print(f"Warning: nodes_to_nl() call failed (attempt {attempt + 1}/{max_retries}): {e}", file=sys.stderr)
-            else:
-                print(f"Error: nodes_to_nl() failed after {max_retries} attempts: {e}", file=sys.stderr)
-                return ("", {})
-
-    # Should not reach here, but fallback just in case
-    return ("", {})
+    return (response_text, node_contributions)
 
 
 def main():
@@ -255,6 +298,12 @@ def main():
         type=str,
         default="kg_grounded",
         help="Identifier for this run (e.g. 'kg_grounded', 'no_kg'). Saved to each output line.",
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=10,
+        help="Log progress every N questions (default: 10, set to 0 to disable logging).",
     )
     args = parser.parse_args()
 
@@ -335,6 +384,8 @@ def main():
                     # Extract node_summaries and call nodes_to_nl() which returns tuple
                     node_summaries = ark_out.get("node_summaries", [])
                     response_text, node_contributions = nodes_to_nl(prompt, node_summaries, args.nl_model)
+                    # Normalize node indices to string format for consistency (Part 0.5)
+                    node_summaries, node_contributions = normalize_node_indices(node_summaries, node_contributions)
 
         return (idx, {
             "prompt_id": prompt_id,
@@ -351,6 +402,7 @@ def main():
 
     new_results: dict[int, dict] = {}
     n_workers = max(1, int(args.n_workers))
+    log_interval = max(0, args.log_interval)  # 0 disables logging
     if to_compute:
         if n_workers == 1:
             for k, i in enumerate(to_compute):
@@ -358,6 +410,12 @@ def main():
                 new_results[i] = out
                 if (k + 1) % 10 == 0 or (k + 1) == len(to_compute):
                     print(f"  {k + 1}/{len(to_compute)} computed.", file=sys.stderr)
+                # Log progress if logging enabled and checkpoint written
+                if log_interval > 0 and (k + 1) % log_interval == 0:
+                    try:
+                        log_phase1_progress(str(output_path), k + 1, log_interval)
+                    except Exception:
+                        pass  # Don't fail if logging fails
         else:
             done = 0
             with ThreadPoolExecutor(max_workers=n_workers) as executor:
@@ -368,6 +426,12 @@ def main():
                     done += 1
                     if done % 10 == 0 or done == len(to_compute):
                         print(f"  {done}/{len(to_compute)} computed.", file=sys.stderr)
+                    # Log progress if logging enabled and checkpoint written
+                    if log_interval > 0 and done % log_interval == 0:
+                        try:
+                            log_phase1_progress(str(output_path), done, log_interval)
+                        except Exception:
+                            pass  # Don't fail if logging fails
         for i in to_compute:
             if i not in new_results:
                 raise RuntimeError(f"Missing result for example index {i}")
