@@ -88,8 +88,8 @@ In other words, for criteria with negative points, a good response should be cla
 Return just the json object in markdown format. Do not include any other text in the response.
 """.strip()
 
-KG_RELEVANCE_TEMPLATE = """
-You are evaluating whether a knowledge graph (KG) helped or hurt a model's response on a specific rubric criterion.
+STAGE_1_ATTRIBUTION_TEMPLATE = """
+You are validating whether a contributed knowledge graph (KG) node was actually mentioned in the grading explanation for a rubric criterion.
 
 # Conversation
 <<conversation>>
@@ -100,40 +100,64 @@ You are evaluating whether a knowledge graph (KG) helped or hurt a model's respo
 # Rubric Criterion
 <<rubric_item>>
 
-# Criterion Outcome
-The criterion was: <<criteria_met>> (True = criterion was met; False = criterion was not met).
-This criterion has <<points>> points (positive = desirable, negative = undesirable).
+# Rubric Grader's Explanation (why criterion was met or not met)
+<<rubric_explanation>>
 
-# Rubric Grader's Explanation
-The evaluating LLM explained: <<rubric_explanation>>
-(Note: You should validate this explanation against the actual conversation and response above.)
+# Node Contribution Claim (what this specific node claims it contributed)
+<<node_contribution>>
 
-# KG Node Contributions (as reported by the response generator)
-The model reported that it used the following nodes to generate its response:
-<<node_contributions>>
+# Task: STAGE 1 - NODE ATTRIBUTION VALIDATION
 
-For example:
-- node_42 contributed: "explanation text"
-- node_108 did NOT contribute: "explanation text"
+Question: Does the rubric grader's explanation DIRECTLY mention or reference what this node claims it contributed?
 
-# Task
-Determine whether the KG helped, hurt, or had no effect on this criterion outcome.
-
-To do this, trace through:
-1. What did each contributed node claim to provide?
-2. Does the response actually incorporate that information? (Verify in the Final Model Response above.)
-3. Did using (or not using) those nodes lead to this criterion being met or not met?
+Think through:
+1. What does this node claim it contributed? (from "Node Contribution Claim" above)
+2. Read the grader's explanation carefully
+3. Does the grader's explanation mention, reference, or require this node's contribution to justify its decision?
 
 Return a JSON object with:
-- "kg_label": one of "kg_helped", "kg_hurt", "kg_neutral"
-  - "kg_helped": A contributed node provided information directly necessary for meeting this criterion
-    (for positive-point criteria: KG info helped satisfy it; for negative-point criteria: KG info helped AVOID the bad behavior)
-  - "kg_hurt": A contributed node actively caused this criterion to fail (or caused a negative-point criterion to be met)
-  - "kg_neutral": No contributed node had a discernible effect on this criterion
-- "kg_reasoning": A detailed causal chain: (1) which node(s) claimed to provide what information, (2) how that info appears in the response, (3) how this led to the criterion being <<criteria_met>>.
-  Example: "Node 42 claimed to provide information about X. The response incorporates X as '[specific text]'. This directly led to criterion Y being met because [specific reason]."
+- "stage_1_passed": true if grader mentions/references this node's contribution, false if not
+- "reasoning": Brief explanation
+  - If true: "Grader mentions [concept] which node claims to contribute"
+  - If false: "Grader's explanation does not mention [concept] from node"
 
-Return just the JSON object in markdown format. Do not include any other text in the response.
+Return just the JSON object in markdown format. Do not include any other text.
+""".strip()
+
+STAGE_2_RESPONSE_VALIDATION_TEMPLATE = """
+You are validating whether a knowledge graph (KG) node's actual content appears in the model's response.
+
+# Conversation
+<<conversation>>
+
+# Final Model Response
+<<response>>
+
+# Rubric Criterion
+<<rubric_item>>
+
+# Rubric Grader's Explanation
+<<rubric_explanation>>
+
+# Raw KG Node Summary (what this node actually contains)
+<<node_summary>>
+
+# Task: STAGE 2 - RESPONSE TEXT VALIDATION
+
+Question: Does the exact node content appear in the response_text, specifically in the part that the grading_explanation references?
+
+Think through:
+1. What does the raw node summary actually say? (from "Raw KG Node Summary" above)
+2. Read the grader's explanation - which part of the response does it reference?
+3. Can you find exact phrases, concepts, or facts from the node summary in that specific part of the response that the grader references?
+
+Return a JSON object with:
+- "stage_2_passed": true if exact node content appears in the response part the grader references, false if not
+- "reasoning": Brief explanation
+  - If true: "Node content '[exact phrase]' found in response in the part grader references"
+  - If false: "Node content does not appear in the part of response grader references"
+
+Return just the JSON object in markdown format. Do not include any other text.
 """.strip()
 
 HEALTHBENCH_HTML_JINJA = (
@@ -330,6 +354,109 @@ def _aggregate_get_clipped_mean(
     )
 
 
+def validate_node_attribution(grader_model, conversation: str, response_text: str, rubric_item: RubricItem, grading_explanation: str, node_contribution: str) -> dict:
+    """STAGE 1: Validate if node is mentioned in grading explanation.
+
+    Args:
+        grader_model: LLM to call for validation
+        conversation: Full conversation string
+        response_text: Model's response
+        rubric_item: The rubric criterion
+        grading_explanation: Grader's explanation for why criterion was met/not met
+        node_contribution: What this node claims it contributed
+
+    Returns:
+        dict with keys: stage_1_passed (bool), reasoning (str)
+    """
+    prompt_text = STAGE_1_ATTRIBUTION_TEMPLATE \
+        .replace("<<conversation>>", conversation) \
+        .replace("<<response>>", response_text) \
+        .replace("<<rubric_item>>", str(rubric_item)) \
+        .replace("<<rubric_explanation>>", grading_explanation) \
+        .replace("<<node_contribution>>", node_contribution)
+
+    while True:
+        result = grader_model([{"role": "user", "content": prompt_text}])
+        parsed = parse_json_to_dict(result.response_text)
+        if "stage_1_passed" in parsed and isinstance(parsed["stage_1_passed"], bool):
+            break
+        print("Stage 1 validation failed (invalid response), retrying...")
+
+    return parsed
+
+
+def validate_node_in_response(grader_model, conversation: str, response_text: str, rubric_item: RubricItem, grading_explanation: str, node_summary: str) -> dict:
+    """STAGE 2: Validate if node content appears in response.
+
+    Args:
+        grader_model: LLM to call for validation
+        conversation: Full conversation string
+        response_text: Model's response
+        rubric_item: The rubric criterion
+        grading_explanation: Grader's explanation (which part of response is relevant)
+        node_summary: Raw KG node summary
+
+    Returns:
+        dict with keys: stage_2_passed (bool), reasoning (str)
+    """
+    prompt_text = STAGE_2_RESPONSE_VALIDATION_TEMPLATE \
+        .replace("<<conversation>>", conversation) \
+        .replace("<<response>>", response_text) \
+        .replace("<<rubric_item>>", str(rubric_item)) \
+        .replace("<<rubric_explanation>>", grading_explanation) \
+        .replace("<<node_summary>>", node_summary)
+
+    while True:
+        result = grader_model([{"role": "user", "content": prompt_text}])
+        parsed = parse_json_to_dict(result.response_text)
+        if "stage_2_passed" in parsed and isinstance(parsed["stage_2_passed"], bool):
+            break
+        print("Stage 2 validation failed (invalid response), retrying...")
+
+    return parsed
+
+
+def apply_semantic_impact(points: float, criteria_met: bool) -> str:
+    """STAGE 3: Apply deterministic semantic logic to determine kg_label.
+
+    IMPORTANT: This function is ONLY called when both Stage 1 and Stage 2 validation passed.
+    (i.e., node was mentioned in grading explanation AND its content appears in response)
+
+    Args:
+        points: Criterion points (positive = desirable, negative = undesirable)
+        criteria_met: Whether criterion was met (T/F)
+
+    Returns:
+        str: kg_label in ["kg_helped", "kg_hurt"]
+    """
+    if points > 0:  # Positive criterion (desirable)
+        return "kg_helped" if criteria_met else "kg_hurt"
+    else:  # points < 0, negative criterion (undesirable)
+        return "kg_hurt" if criteria_met else "kg_helped"
+
+
+def handle_validation_failure(stage_1_passed: bool, stage_2_reasoning: str = None) -> dict:
+    """Handle cases where Stage 1 or Stage 2 validation failed.
+
+    Args:
+        stage_1_passed: Whether Stage 1 validation passed
+        stage_2_reasoning: Stage 2 reasoning (if Stage 1 passed but Stage 2 failed)
+
+    Returns:
+        dict with keys: kg_label (str), validation_reasoning (str)
+    """
+    if not stage_1_passed:
+        return {
+            "kg_label": "kg_neutral",
+            "validation_reasoning": "Node was not mentioned in grading explanation (Stage 1 failed) - node was not causal to grading decision"
+        }
+    else:  # stage_1_passed=true, but stage_2 failed
+        return {
+            "kg_label": "kg_attributed_but_not_in_response",
+            "validation_reasoning": f"Node mentioned in grading explanation but content doesn't appear in response (Stage 2 failed). Stage 2 reasoning: {stage_2_reasoning}"
+        }
+
+
 class HealthBenchEval(Eval):
     def __init__(
         self,
@@ -517,68 +644,261 @@ class HealthBenchEval(Eval):
         # Build kg_labels by asking grader to map node contributions to criterion outcomes
         kg_reasoning_details = {}  # Store detailed reasoning for downstream cross-run analysis
 
-        if run_tag == "kg_grounded" and node_contributions:
-            # Format the conversation string once for reuse
-            convo_str = "\n\n".join(
-                [f"{m['role']}: {m['content']}" for m in convo_with_response]
-            )
+        if run_tag == "kg_grounded" and node_contributions and node_summaries:
+            # Import Issue 2.5 implementation (Parts 2-5)
+            from . import kg_node_validation_part2
 
-            # Format the node contributions for the grader
-            contrib_text = "\n".join(
-                f"  - node_{idx}: {data.get('explanation', '(no explanation)')}  [{'CONTRIBUTED' if data.get('contributed') else 'DID NOT CONTRIBUTE'}]"
-                for idx, data in node_contributions.items()
-            )
+            # PART 2: Node-level preprocessing (validates final_contributed status)
+            per_node_metadata = []
+            for node_summary in node_summaries:
+                node_id = str(node_summary.get("index", node_summary.get("name", "")))
+                node_contrib = node_contributions.get(node_id, {})
 
-            def grade_kg_relevance(rubric_item_and_grade):
-                rubric_item, grading_response = rubric_item_and_grade
-
-                prompt_text = KG_RELEVANCE_TEMPLATE \
-                    .replace("<<conversation>>", convo_str) \
-                    .replace("<<response>>", response_text) \
-                    .replace("<<rubric_item>>", str(rubric_item)) \
-                    .replace("<<criteria_met>>", str(grading_response["criteria_met"])) \
-                    .replace("<<points>>", str(rubric_item.points)) \
-                    .replace("<<rubric_explanation>>", grading_response.get("explanation", "(no explanation)")) \
-                    .replace("<<node_contributions>>", contrib_text)
-
-                # Optional: add raw node summaries if validation mode is enabled
-                if validate_node_contributions and node_summaries:
-                    raw_nodes_text = "\n\n".join(
-                        f"Node {n['index']} ({n['name']}):\n{n['summary']}"
-                        for n in node_summaries
+                try:
+                    node_part2 = kg_node_validation_part2.process_node_part2(
+                        response_text=response_text,
+                        node_index=node_id,
+                        node_summary=node_summary.get("summary", ""),
+                        initial_contributed=node_contrib.get("contributed", False),
+                        initial_contribution_explanation=node_contrib.get("explanation", ""),
+                        model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-4.1",
                     )
-                    prompt_text += f"\n\n# Raw KG Node Summaries (for reference/validation):\n{raw_nodes_text}"
+                    # Add node_id to Part 2 output for downstream tracking
+                    node_part2["node_id"] = node_id
+                    per_node_metadata.append(node_part2)
+                except Exception as e:
+                    # Fallback: use initial_contributed if Part 2 fails
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Part 2 processing failed for node {node_id}: {e}")
+                    per_node_metadata.append({
+                        "node_id": node_id,
+                        "final_contributed": node_contrib.get("contributed", False),
+                        "final_node_contribution_explanation": node_contrib.get("explanation", ""),
+                    })
 
-                while True:
-                    result = self.grader_model([{"role": "user", "content": prompt_text}])
-                    parsed = parse_json_to_dict(result.response_text)
-                    # Require both kg_label AND kg_reasoning (new field)
-                    if (parsed.get("kg_label") in ("kg_helped", "kg_hurt", "kg_neutral")
-                        and "kg_reasoning" in parsed):
-                        break
-                    print("KG relevance grading failed (missing kg_label or kg_reasoning), retrying...")
-                return parsed
+            # PART 3: For each (node, criterion) pair, assign node-level label
+            per_criterion_metadata = []
+            for criterion_idx, (rubric_item, grading_response) in enumerate(
+                zip(rubric_items, grading_response_list)
+            ):
+                criterion_data = {
+                    "criterion_statement": rubric_item.criterion,
+                    "points": rubric_item.points,
+                    "criteria_met": grading_response["criteria_met"],
+                    "grading_explanation": grading_response.get("explanation", ""),
+                    "node_labels": [],
+                }
 
-            kg_labels = common.map_with_progress(
-                grade_kg_relevance,
-                list(zip(rubric_items, grading_response_list)),
-                pbar=False,
-            )
+                for node_part2 in per_node_metadata:
+                    # Find corresponding node_summary
+                    node_summary = next(
+                        (n for n in node_summaries
+                         if str(n.get("index", n.get("name", ""))) == node_part2["node_id"]),
+                        {}
+                    )
 
-            # Store reasoning details keyed by rubric criterion for cross-run comparison
-            for i, (rubric_item, kg_label) in enumerate(zip(rubric_items, kg_labels)):
-                criterion_key = f"criterion_{rubric_item.criterion[:50]}"  # Use truncated criterion as key
+                    try:
+                        node_label = kg_node_validation_part2.process_node_criterion_pair_part3(
+                            node_index=node_part2["node_id"],
+                            final_contributed=node_part2["final_contributed"],
+                            final_node_contribution_explanation=node_part2["final_node_contribution_explanation"],
+                            node_summary=node_summary.get("summary", ""),
+                            criterion_statement=rubric_item.criterion,
+                            criteria_met=grading_response["criteria_met"],
+                            points=rubric_item.points,
+                            grading_explanation=grading_response.get("explanation", ""),
+                            model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-4.1",
+                        )
+                        criterion_data["node_labels"].append({
+                            "node_id": node_part2["node_id"],
+                            **node_label
+                        })
+                    except Exception as e:
+                        # Fallback if Part 3 fails
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.warning(f"Part 3 labeling failed for node {node_part2['node_id']}: {e}")
+                        criterion_data["node_labels"].append({
+                            "node_id": node_part2["node_id"],
+                            "final_node_label": "error_in_labeling",
+                            "error": str(e)
+                        })
+
+                per_criterion_metadata.append(criterion_data)
+
+            # PART 4: Aggregate per criterion (using actual Part 4 functions)
+            for criterion_idx, criterion_data in enumerate(per_criterion_metadata):
+                # Get node labels for this criterion (Part 3 outputs)
+                node_criterion_labels = criterion_data["node_labels"]
+
+                if not node_criterion_labels:
+                    # No nodes for this criterion - mark as neutral
+                    criterion_data["num_helped_nodes"] = 0
+                    criterion_data["num_hurt_nodes"] = 0
+                    criterion_data["num_neutral_nodes"] = 0
+                    criterion_data["num_contradiction_nodes"] = 0
+                    criterion_data["num_unclear_direction_nodes"] = 0
+                    criterion_data["contradiction_ratio"] = 0.0
+                    criterion_data["mixed_signals"] = False
+                    criterion_data["kg_influence_label"] = "KG_NEUTRAL"
+                    criterion_data["confidence_level"] = "LOW"
+                    criterion_data["kg_label"] = "kg_neutral"
+                    criterion_data["kg_reasoning"] = "No nodes available for this criterion"
+                    continue
+
+                # Step 4.1: Count node labels by type
+                try:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    part4_1_result = kg_node_validation_part2.step_4_1_count_labels(
+                        node_criterion_labels
+                    )
+                    criterion_data.update(part4_1_result)
+                except Exception as e:
+                    logger.warning(f"Part 4.1 failed for criterion {criterion_idx}: {e}")
+                    criterion_data["num_helped_nodes"] = 0
+                    criterion_data["num_hurt_nodes"] = 0
+                    criterion_data["num_neutral_nodes"] = len(node_criterion_labels)
+                    criterion_data["num_contradiction_nodes"] = 0
+                    criterion_data["num_unclear_direction_nodes"] = 0
+                    criterion_data["contradiction_ratio"] = 0.0
+                    criterion_data["mixed_signals"] = False
+
+                # Step 4.2: Assign KG influence label
+                try:
+                    part4_2_result = kg_node_validation_part2.step_4_2_assign_kg_influence_label(
+                        num_helped_nodes=criterion_data.get("num_helped_nodes", 0),
+                        num_hurt_nodes=criterion_data.get("num_hurt_nodes", 0),
+                        num_neutral_nodes=criterion_data.get("num_neutral_nodes", 0),
+                        num_contradiction_nodes=criterion_data.get("num_contradiction_nodes", 0),
+                        contradiction_ratio=criterion_data.get("contradiction_ratio", 0.0),
+                        mixed_signals=criterion_data.get("mixed_signals", False),
+                    )
+                    criterion_data["kg_influence_label"] = part4_2_result.get("kg_influence_label", "KG_NEUTRAL")
+                    criterion_data["assignment_reason"] = part4_2_result.get("assignment_reason", "")
+                except Exception as e:
+                    logger.warning(f"Part 4.2 failed for criterion {criterion_idx}: {e}")
+                    criterion_data["kg_influence_label"] = "KG_NEUTRAL"
+                    criterion_data["assignment_reason"] = f"Error in assignment: {str(e)}"
+
+                # Step 4.3: Calculate confidence level
+                try:
+                    part4_3_result = kg_node_validation_part2.step_4_3_calculate_confidence_level(
+                        contradiction_ratio=criterion_data.get("contradiction_ratio", 0.0),
+                        num_helped_nodes=criterion_data.get("num_helped_nodes", 0),
+                        num_hurt_nodes=criterion_data.get("num_hurt_nodes", 0),
+                    )
+                    criterion_data["confidence_level"] = part4_3_result.get("confidence_level", "LOW")
+                    criterion_data["confidence_reasoning"] = part4_3_result.get("confidence_reasoning", "")
+                except Exception as e:
+                    logger.warning(f"Part 4.3 failed for criterion {criterion_idx}: {e}")
+                    criterion_data["confidence_level"] = "LOW"
+                    criterion_data["confidence_reasoning"] = f"Error in confidence calc: {str(e)}"
+
+                # Step 4.5: High contradiction analysis (if contradiction_ratio >= 0.25)
+                if criterion_data.get("contradiction_ratio", 0.0) >= 0.25:
+                    try:
+                        part4_5_result = kg_node_validation_part2.step_4_5_analyze_high_contradictions(
+                            node_criterion_labels=node_criterion_labels,
+                            criterion_statement=criterion_data.get("criterion_statement", ""),
+                            grading_explanation=criterion_data.get("grading_explanation", ""),
+                            model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-4.1",
+                        )
+                        criterion_data["high_contradiction_label_consistency"] = part4_5_result.get("high_contradiction_label_consistency")
+                        criterion_data["high_contradiction_resolution_insight"] = part4_5_result.get("high_contradiction_resolution_insight")
+                        criterion_data["high_contradiction_consistency_reasoning"] = part4_5_result.get("high_contradiction_consistency_reasoning")
+                    except Exception as e:
+                        logger.warning(f"Part 4.5 failed for criterion {criterion_idx}: {e}")
+
+                # Step 4.7: Conflicting signals analysis (if mixed_signals = True)
+                if criterion_data.get("mixed_signals", False):
+                    try:
+                        part4_7_result = kg_node_validation_part2.step_4_7_analyze_conflicting_signals(
+                            node_criterion_labels=node_criterion_labels,
+                            criterion_statement=criterion_data.get("criterion_statement", ""),
+                            grading_explanation=criterion_data.get("grading_explanation", ""),
+                            model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-4.1",
+                        )
+                        criterion_data["conflicting_signals_label_consistency"] = part4_7_result.get("conflicting_signals_label_consistency")
+                        criterion_data["conflicting_signals_weighting"] = part4_7_result.get("conflicting_signals_weighting")
+                        criterion_data["conflicting_signals_dominant_influence"] = part4_7_result.get("conflicting_signals_dominant_influence")
+                        criterion_data["conflicting_signals_consistency_reasoning"] = part4_7_result.get("conflicting_signals_consistency_reasoning")
+                    except Exception as e:
+                        logger.warning(f"Part 4.7 failed for criterion {criterion_idx}: {e}")
+
+                # For backward compatibility: set kg_label and kg_reasoning based on kg_influence_label
+                kg_label = criterion_data.get("kg_influence_label", "KG_NEUTRAL")
+                if kg_label.startswith("KG_HELPED"):
+                    criterion_data["kg_label"] = "kg_helped"
+                elif kg_label.startswith("KG_HURT"):
+                    criterion_data["kg_label"] = "kg_hurt"
+                else:
+                    criterion_data["kg_label"] = "kg_neutral"
+
+                criterion_data["kg_reasoning"] = (
+                    f"{criterion_data.get('kg_influence_label', 'KG_NEUTRAL')}: "
+                    f"Helped={criterion_data.get('num_helped_nodes', 0)}, "
+                    f"Hurt={criterion_data.get('num_hurt_nodes', 0)}, "
+                    f"Neutral={criterion_data.get('num_neutral_nodes', 0)}"
+                )
+
+            # Merge Part 2, 3, and 4 fields into rubric_items_with_grades
+            for idx, criterion_data in enumerate(per_criterion_metadata):
+                if idx < len(rubric_items_with_grades):
+                    # Add Part 4 aggregation fields to grading output
+                    part4_fields = {
+                        "num_helped_nodes": criterion_data.get("num_helped_nodes"),
+                        "num_hurt_nodes": criterion_data.get("num_hurt_nodes"),
+                        "num_neutral_nodes": criterion_data.get("num_neutral_nodes"),
+                        "num_contradiction_nodes": criterion_data.get("num_contradiction_nodes"),
+                        "num_unclear_direction_nodes": criterion_data.get("num_unclear_direction_nodes"),
+                        "contradiction_ratio": criterion_data.get("contradiction_ratio"),
+                        "mixed_signals": criterion_data.get("mixed_signals"),
+                        # Part 4.2 fields
+                        "kg_influence_label": criterion_data.get("kg_influence_label"),
+                        "assignment_reason": criterion_data.get("assignment_reason"),
+                        # Part 4.3 fields
+                        "confidence_level": criterion_data.get("confidence_level"),
+                        "confidence_reasoning": criterion_data.get("confidence_reasoning"),
+                        # Part 4.5 fields (conditional)
+                        "high_contradiction_label_consistency": criterion_data.get("high_contradiction_label_consistency"),
+                        "high_contradiction_resolution_insight": criterion_data.get("high_contradiction_resolution_insight"),
+                        "high_contradiction_consistency_reasoning": criterion_data.get("high_contradiction_consistency_reasoning"),
+                        # Part 4.7 fields (conditional)
+                        "conflicting_signals_label_consistency": criterion_data.get("conflicting_signals_label_consistency"),
+                        "conflicting_signals_weighting": criterion_data.get("conflicting_signals_weighting"),
+                        "conflicting_signals_dominant_influence": criterion_data.get("conflicting_signals_dominant_influence"),
+                        "conflicting_signals_consistency_reasoning": criterion_data.get("conflicting_signals_consistency_reasoning"),
+                        # Part 3: Include raw node_labels for complete auditability
+                        "node_labels": criterion_data.get("node_labels", []),
+                    }
+                    rubric_items_with_grades[idx].update(part4_fields)
+
+            # Build kg_reasoning_details from per_criterion_metadata
+            kg_reasoning_details = {}
+            for criterion_data in per_criterion_metadata:
+                criterion_key = f"criterion_{criterion_data['criterion_statement'][:50]}"
                 kg_reasoning_details[criterion_key] = {
-                    "kg_label": kg_label.get("kg_label"),
-                    "kg_reasoning": kg_label.get("kg_reasoning"),
+                    "kg_label": criterion_data.get("kg_label"),
+                    "kg_reasoning": criterion_data.get("kg_reasoning"),
                     "contributed_nodes": [
-                        {"index": idx, "explanation": data.get("explanation")}
-                        for idx, data in node_contributions.items()
-                        if data.get("contributed")
+                        {"index": nl.get("node_id"), "label": nl.get("final_node_label")}
+                        for nl in criterion_data.get("node_labels", [])
+                        if nl.get("node_id") and nl.get("final_node_label") != "error_in_labeling"
                     ]
                 }
+
+            # Build kg_labels for metrics calculation (compatible with calculate_kg_relevance_score)
+            kg_labels = []
+            for criterion_data in per_criterion_metadata:
+                kg_labels.append({
+                    "kg_label": criterion_data.get("kg_label"),
+                    "kg_reasoning": criterion_data.get("kg_reasoning", "")
+                })
         else:
-            # For no_kg runs: label as None (not applicable)
+            # For no_kg runs: empty metadata and no labels
+            kg_reasoning_details = {}
             kg_labels = [{"kg_label": None, "kg_reasoning": None}] * len(rubric_items)
 
         # Add kg_relevance_score to metrics dict for aggregation (Step 5 Part B)
@@ -586,7 +906,14 @@ class HealthBenchEval(Eval):
         if kg_relevance_score_for_metrics is not None:
             metrics["kg_relevance_score"] = kg_relevance_score_for_metrics
 
-        return metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details
+        # Return per_node_metadata and per_criterion_metadata for complete auditability
+        # These are intermediate Part 2-3 outputs needed for training predictors
+        intermediate_metadata = {
+            "per_node_metadata": per_node_metadata if 'per_node_metadata' in locals() else [],
+            "per_criterion_metadata": per_criterion_metadata if 'per_criterion_metadata' in locals() else [],
+        }
+
+        return metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details, intermediate_metadata
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(row: dict):
