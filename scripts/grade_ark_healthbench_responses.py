@@ -264,6 +264,13 @@ def main():
         default=10,
         help="Log progress every N questions (default: 10, set to 0 to disable logging).",
     )
+    parser.add_argument(
+        "--skip-on-error",
+        action="store_true",
+        default=False,
+        help="Skip examples that fail grading instead of crashing (default: False, crash on error). "
+        "With this flag, failed examples are logged but grading continues, all others are processed successfully.",
+    )
     args = parser.parse_args()
 
     response_path = Path(args.responses_jsonl)
@@ -329,8 +336,12 @@ def main():
     # --- Grade loop with checkpoint: process each example, skip cached, handle content-filter ---
     examples = eval_obj.examples
     skipped_content_filter = 0
+    skipped_grading_errors = 0
     log_interval = max(0, args.log_interval)  # 0 disables logging
+    skip_on_error = args.skip_on_error
     print("Running HealthBench grading on precomputed responses...", file=sys.stderr)
+    if skip_on_error:
+        print("[PRODUCTION MODE] --skip-on-error enabled: failed examples will be skipped, others processed successfully", file=sys.stderr)
     for i in tqdm(range(len(examples)), desc="Grading"):
         if i in completed:
             continue
@@ -349,7 +360,7 @@ def main():
             node_summaries = sampler_response.response_metadata.get("node_summaries", [])
             run_tag = sampler_response.response_metadata.get("run_tag", "no_kg")
 
-            metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details = eval_obj.grade_sample(
+            metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details, intermediate_metadata = eval_obj.grade_sample(
                 prompt=actual_queried_prompt_messages,
                 response_text=response_text,
                 rubric_items=row["rubrics"],
@@ -393,6 +404,9 @@ def main():
                     # Issue #2.5: Preserve node data from Phase 1 for Part 3 (node+criterion labeling)
                     "node_summaries": node_summaries,
                     "node_contributions": node_contributions,
+                    # Complete audit trail: Parts 2-3 intermediate data for training predictors
+                    "per_node_metadata": intermediate_metadata.get("per_node_metadata", []),
+                    "per_criterion_metadata": intermediate_metadata.get("per_criterion_metadata", []),
                 },
             )
             completed[i] = single_result
@@ -411,10 +425,18 @@ def main():
             logging.warning("Content filter skip index=%d prompt_id=%s: %s", i, prompt_id, e)
         except Exception as e:
             logging.error("Grading failed index=%d prompt_id=%s: %s", i, prompt_id, e)
-            raise
+            if skip_on_error:
+                # Production mode: log error and skip this example
+                skipped_grading_errors += 1
+                logging.warning("Skipping failed example (--skip-on-error enabled). Continuing to next example.")
+            else:
+                # Default mode: fail on error (safe checkpoint, can restart)
+                raise
 
     if skipped_content_filter:
         print(f"Skipped {skipped_content_filter} examples due to content filter.", file=sys.stderr)
+    if skipped_grading_errors:
+        print(f"Skipped {skipped_grading_errors} examples due to grading errors (--skip-on-error enabled).", file=sys.stderr)
 
     # --- Aggregate and write report (only successfully graded examples) ---
     results = [completed[i] for i in range(len(examples)) if i in completed]
