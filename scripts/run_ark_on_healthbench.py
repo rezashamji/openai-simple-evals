@@ -254,23 +254,33 @@ Important:
     api_base = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get("AZURE_OPENAI_API_BASE") or os.environ.get("AZURE_API_BASE")
     api_version = os.environ.get("AZURE_OPENAI_API_VERSION") or os.environ.get("AZURE_API_VERSION")
 
-    response = completion(
-        model=model_name,
-        messages=messages,
-        response_format={"type": "json_object"},
-        max_tokens=2048,
-        timeout=30,
-        api_key=api_key,
-        api_base=api_base,
-        api_version=api_version,
-    )
-    content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-    parsed = json.loads(content.strip())
+    try:
+        response = completion(
+            model=model_name,
+            messages=messages,
+            response_format={"type": "json_object"},
+            max_tokens=2048,
+            timeout=30,
+            api_key=api_key,
+            api_base=api_base,
+            api_version=api_version,
+        )
+        content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        parsed = json.loads(content.strip())
 
-    response_text = parsed.get("final_answer", "").strip()
-    node_contributions = parsed.get("node_contributions", {})
+        response_text = parsed.get("final_answer", "").strip()
+        node_contributions = parsed.get("node_contributions", {})
 
-    return (response_text, node_contributions)
+        return (response_text, node_contributions)
+    except Exception as e:
+        print(f"[nodes_to_nl ERROR] {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+        if not api_key:
+            print(f"  WARNING: api_key is None/empty", file=sys.stderr)
+        if not api_base:
+            print(f"  WARNING: api_base is None/empty", file=sys.stderr)
+        if not api_version:
+            print(f"  WARNING: api_version is None/empty", file=sys.stderr)
+        return ("", {})
 
 
 def main():
@@ -305,6 +315,13 @@ def main():
         default=10,
         help="Log progress every N questions (default: 10, set to 0 to disable logging).",
     )
+    parser.add_argument(
+        "--search-mode",
+        type=str,
+        choices=["bm25", "embedding", "hybrid"],
+        default="bm25",
+        help="Search mode for ARK graph retrieval: bm25 (keyword), embedding (dense vectors), or hybrid (RRF fusion). Default: bm25.",
+    )
     args = parser.parse_args()
 
     ark_dir = Path(args.ark_dir).resolve()
@@ -320,8 +337,7 @@ def main():
     with open(args.input_jsonl, "r", encoding="utf-8") as f:
         examples = [json.loads(line) for line in f if line.strip()]
     if args.limit is not None:
-        n = min(args.limit, len(examples))
-        examples = random.Random(0).sample(examples, n)
+        examples = examples[:args.limit]
 
     output_path = Path(args.output_jsonl)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,7 +369,14 @@ def main():
             "--model_name", args.ark_model,
             "--max_steps", str(args.ark_max_steps),
             "--number_of_agents", str(args.ark_agents),
+            "--search-mode", args.search_mode,
         ]
+        # If using embedding/hybrid search, compute embeddings path
+        if args.search_mode in ["embedding", "hybrid"]:
+            graph_dir = ark_dir / "benchmarks" / "stark" / "data" / "graphs" / args.graph_name
+            embeddings_path = graph_dir / "embeddings_kalm.npy"
+            if embeddings_path.exists():
+                cmd.extend(["--embeddings-path", str(embeddings_path)])
         try:
             result = subprocess.run(
                 cmd,
@@ -371,11 +394,39 @@ def main():
         node_contributions = {}
 
         if result.returncode != 0:
+            if args.search_mode != "bm25":
+                print(f"[ARK_ERROR] search_mode={args.search_mode} returncode={result.returncode}", file=sys.stderr)
+                print(f"[ARK_STDERR]\n{result.stderr}", file=sys.stderr)
             pass  # Defaults remain empty
         else:
+            # Log subprocess output for embedding/hybrid modes (for debugging)
+            if args.search_mode != "bm25" and result.stderr:
+                print(f"[ARK_DEBUG] search_mode={args.search_mode} subprocess stderr:", file=sys.stderr)
+                stderr_lines = result.stderr.split('\n')
+                # Log lines with EMBEDDING_DEBUG or RRF_DEBUG prefix or first/last 10 lines
+                debug_lines = [l for l in stderr_lines if 'EMBEDDING_DEBUG' in l or 'RRF_DEBUG' in l]
+                if debug_lines:
+                    for line in debug_lines[:50]:  # First 50 debug lines (more for RRF output)
+                        print(f"  {line}", file=sys.stderr)
+                else:
+                    # If no debug output, log first and last few lines to see what happened
+                    for line in stderr_lines[:5]:
+                        if line.strip():
+                            print(f"  {line}", file=sys.stderr)
+                    if len(stderr_lines) > 10:
+                        print(f"  ...", file=sys.stderr)
+                        for line in stderr_lines[-5:]:
+                            if line.strip():
+                                print(f"  {line}", file=sys.stderr)
+
             try:
                 ark_out = json.loads(result.stdout.strip())
             except json.JSONDecodeError:
+                if args.search_mode != "bm25":
+                    print(f"[ARK_PARSE_ERROR] Failed to parse JSON from subprocess for search_mode={args.search_mode}", file=sys.stderr)
+                    print(f"  stdout length: {len(result.stdout)}", file=sys.stderr)
+                    if result.stdout:
+                        print(f"  stdout preview: {result.stdout[:200]}", file=sys.stderr)
                 pass  # Defaults remain empty
             else:
                 if ark_out.get("error"):
