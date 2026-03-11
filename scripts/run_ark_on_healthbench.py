@@ -291,7 +291,7 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Max number of examples (same order as HealthBench eval).")
     parser.add_argument("--python", type=str, default=None, help="Python for ARK subprocess (default: ark/.venv/bin/python).")
     parser.add_argument("--nl-model", type=str, default="azure/gpt-4.1", help="Model for nodes→NL (default same as ARK).")
-    parser.add_argument("--n-workers", type=int, default=1, help="Parallel workers for questions (1=sequential). Speeds run without changing ARK method.")
+    parser.add_argument("--n-workers", type=int, default=16, help="Parallel workers for questions (default: 16, optimized from testing; 1=sequential). Speeds run without changing ARK method. Test on your hardware: 8-32 workers typical sweet spot.")
     parser.add_argument("--graph-name", type=str, default="prime", help="ARK KG (e.g. prime). Pass when you run to make the run explicit.")
     parser.add_argument("--ark-model", type=str, default="azure/gpt-4.1", help="ARK backbone. Pass when you run (e.g. azure/gpt-4.1).")
     parser.add_argument("--ark-agents", type=int, default=3, help="ARK parallel agents (paper A.2: n=3).")
