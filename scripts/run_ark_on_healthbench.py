@@ -383,7 +383,7 @@ def main():
                 cwd=str(stark_dir),
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=1200,
                 env={**os.environ},
             )
         finally:
