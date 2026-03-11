@@ -18,7 +18,9 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from tqdm import tqdm
@@ -212,6 +214,108 @@ def _load_checkpoint(checkpoint_path: Path) -> dict[int, SingleEvalResult]:
     return completed
 
 
+def grade_example_safe(i, row, eval_obj, sampler, skip_on_error, validate_node_contributions):
+    """Grade a single example. Called by ThreadPoolExecutor workers.
+
+    Returns:
+        (i, single_result) on success
+        (i, None) on error (if skip_on_error=True)
+        Raises exception (if skip_on_error=False)
+    """
+    prompt_id = row.get("prompt_id", f"index_{i}")
+    prompt_messages = row["prompt"]
+
+    try:
+        # Get response from sampler (precomputed, just indexed lookup)
+        sampler_response = sampler.get_response_at_index(i, prompt_messages)
+        response_text = sampler_response.response_text
+        response_usage = sampler_response.response_metadata.get("usage", None)
+        actual_queried_prompt_messages = sampler_response.actual_queried_message_list
+
+        # Extract KG-related fields from sampler response (contains full Phase 1 output)
+        node_contributions = sampler_response.response_metadata.get("node_contributions", {})
+        node_summaries = sampler_response.response_metadata.get("node_summaries", [])
+        run_tag = sampler_response.response_metadata.get("run_tag", "no_kg")
+
+        # Call grade_sample (the expensive function with 340+ LLM calls)
+        metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details, intermediate_metadata = eval_obj.grade_sample(
+            prompt=actual_queried_prompt_messages,
+            response_text=response_text,
+            rubric_items=row["rubrics"],
+            example_tags=row["example_tags"],
+            node_contributions=node_contributions,
+            node_summaries=node_summaries,
+            run_tag=run_tag,
+            validate_node_contributions=validate_node_contributions,
+        )
+        score = metrics["overall_score"]
+
+        # Build HTML report
+        html = common.jinja_env.from_string(
+            HEALTHBENCH_HTML_JINJA.replace(
+                "{{ rubric_grades }}",
+                readable_explanation_str.replace("\n", "<br>"),
+            )
+        ).render(
+            prompt_messages=actual_queried_prompt_messages,
+            next_message=dict(content=response_text, role="assistant"),
+            score=metrics["overall_score"],
+            extracted_answer=response_text,
+        )
+        convo = actual_queried_prompt_messages + [dict(content=response_text, role="assistant")]
+
+        # Build result
+        single_result = SingleEvalResult(
+            html=html,
+            score=score,
+            convo=convo,
+            metrics=metrics,
+            example_level_metadata={
+                "score": score,
+                "usage": get_usage_dict(response_usage),
+                "rubric_items": rubric_items_with_grades,
+                "prompt": actual_queried_prompt_messages,
+                "completion": [dict(content=response_text, role="assistant")],
+                "prompt_id": prompt_id,
+                "completion_id": hashlib.sha256(
+                    (prompt_id + response_text).encode("utf-8")
+                ).hexdigest(),
+                "kg_reasoning_details": kg_reasoning_details,
+                "run_tag": run_tag,
+                "node_summaries": node_summaries,
+                "node_contributions": node_contributions,
+                "per_node_metadata": intermediate_metadata.get("per_node_metadata", []),
+                "per_criterion_metadata": intermediate_metadata.get("per_criterion_metadata", []),
+            },
+        )
+        return (i, single_result)
+
+    except ContentFilterSkipError as e:
+        logging.warning("Content filter skip index=%d prompt_id=%s: %s", i, prompt_id, e)
+        return (i, None)
+    except Exception as e:
+        logging.error("Grading failed index=%d prompt_id=%s: %s", i, prompt_id, e)
+        if skip_on_error:
+            logging.warning("Skipping failed example (--skip-on-error enabled). Continuing to next example.")
+            return (i, None)
+        else:
+            raise
+
+
+def thread_safe_checkpoint_append(i, result, checkpoint_path, lock):
+    """Thread-safe append to checkpoint file using lock.
+
+    Args:
+        i: example index
+        result: SingleEvalResult
+        checkpoint_path: Path to checkpoint JSONL
+        lock: threading.Lock() for synchronization
+    """
+    with lock:
+        with open(checkpoint_path, "a", encoding="utf-8") as cf:
+            cf.write(json.dumps(_single_result_to_checkpoint_dict(i, result)) + "\n")
+
+
 def main():
     """
     Phase 2: Grade a response jsonl (from Phase 1) with HealthBench rubrics.
@@ -270,6 +374,14 @@ def main():
         default=False,
         help="Skip examples that fail grading instead of crashing (default: False, crash on error). "
         "With this flag, failed examples are logged but grading continues, all others are processed successfully.",
+    )
+    parser.add_argument(
+        "--n-workers-phase2a",
+        type=int,
+        default=4,
+        help="Parallel workers for example-level grading (default: 4). Higher = faster but more LLM concurrency. "
+        "Test on your hardware: 2-8 typical range. Each worker grades one question at a time (340+ LLM calls/question). "
+        "4 workers × 350 calls = 1400 concurrent LLM calls. Start low, scale up if rate limits allow.",
     )
     args = parser.parse_args()
 
@@ -342,96 +454,75 @@ def main():
     print("Running HealthBench grading on precomputed responses...", file=sys.stderr)
     if skip_on_error:
         print("[PRODUCTION MODE] --skip-on-error enabled: failed examples will be skipped, others processed successfully", file=sys.stderr)
-    for i in tqdm(range(len(examples)), desc="Grading"):
-        if i in completed:
-            continue
-        row = examples[i]
-        prompt_id = row.get("prompt_id", f"index_{i}")
-        prompt_messages = row["prompt"]
-        logging.info("Grading index=%d prompt_id=%s", i, prompt_id)
-        try:
-            sampler_response = sampler.get_response_at_index(i, prompt_messages)
-            response_text = sampler_response.response_text
-            response_usage = sampler_response.response_metadata.get("usage", None)
-            actual_queried_prompt_messages = sampler_response.actual_queried_message_list
 
-            # Extract KG-related fields from sampler response (contains full Phase 1 output)
-            node_contributions = sampler_response.response_metadata.get("node_contributions", {})
-            node_summaries = sampler_response.response_metadata.get("node_summaries", [])
-            run_tag = sampler_response.response_metadata.get("run_tag", "no_kg")
+    # --- Build list of examples to compute (skip already completed) ---
+    to_compute = [i for i in range(len(examples)) if i not in completed]
 
-            metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details, intermediate_metadata = eval_obj.grade_sample(
-                prompt=actual_queried_prompt_messages,
-                response_text=response_text,
-                rubric_items=row["rubrics"],
-                example_tags=row["example_tags"],
-                node_contributions=node_contributions,
-                node_summaries=node_summaries,
-                run_tag=run_tag,
-                validate_node_contributions=args.validate_node_contributions,
-            )
-            score = metrics["overall_score"]
+    # --- Threading setup ---
+    n_workers = args.n_workers_phase2a
+    checkpoint_lock = threading.Lock()
 
-            html = common.jinja_env.from_string(
-                HEALTHBENCH_HTML_JINJA.replace(
-                    "{{ rubric_grades }}",
-                    readable_explanation_str.replace("\n", "<br>"),
-                )
-            ).render(
-                prompt_messages=actual_queried_prompt_messages,
-                next_message=dict(content=response_text, role="assistant"),
-                score=metrics["overall_score"],
-                extracted_answer=response_text,
-            )
-            convo = actual_queried_prompt_messages + [dict(content=response_text, role="assistant")]
-            single_result = SingleEvalResult(
-                html=html,
-                score=score,
-                convo=convo,
-                metrics=metrics,
-                example_level_metadata={
-                    "score": score,
-                    "usage": get_usage_dict(response_usage),
-                    "rubric_items": rubric_items_with_grades,
-                    "prompt": actual_queried_prompt_messages,
-                    "completion": [dict(content=response_text, role="assistant")],
-                    "prompt_id": prompt_id,
-                    "completion_id": hashlib.sha256(
-                        (prompt_id + response_text).encode("utf-8")
-                    ).hexdigest(),
-                    "kg_reasoning_details": kg_reasoning_details,
-                    "run_tag": run_tag,
-                    # Issue #2.5: Preserve node data from Phase 1 for Part 3 (node+criterion labeling)
-                    "node_summaries": node_summaries,
-                    "node_contributions": node_contributions,
-                    # Complete audit trail: Parts 2-3 intermediate data for training predictors
-                    "per_node_metadata": intermediate_metadata.get("per_node_metadata", []),
-                    "per_criterion_metadata": intermediate_metadata.get("per_criterion_metadata", []),
-                },
-            )
-            completed[i] = single_result
-            # Append to checkpoint after each successful grade
-            with open(checkpoint_path, "a", encoding="utf-8") as cf:
-                cf.write(json.dumps(_single_result_to_checkpoint_dict(i, single_result)) + "\n")
+    print(f"Using {n_workers} workers for example-level parallelization (Phase 2A)", file=sys.stderr)
+    print(f"Computing {len(to_compute)} examples (skipping {len(completed)} already completed)", file=sys.stderr)
 
-            # Log progress if logging enabled
-            if log_interval > 0 and (i + 1) % log_interval == 0:
-                try:
-                    log_grading_progress(str(checkpoint_path), i + 1, log_interval)
-                except Exception:
-                    pass  # Don't fail if logging fails
-        except ContentFilterSkipError as e:
-            skipped_content_filter += 1
-            logging.warning("Content filter skip index=%d prompt_id=%s: %s", i, prompt_id, e)
-        except Exception as e:
-            logging.error("Grading failed index=%d prompt_id=%s: %s", i, prompt_id, e)
-            if skip_on_error:
-                # Production mode: log error and skip this example
-                skipped_grading_errors += 1
-                logging.warning("Skipping failed example (--skip-on-error enabled). Continuing to next example.")
+    if n_workers == 1:
+        # Sequential mode (for debugging)
+        print("Running in sequential mode (n_workers=1)", file=sys.stderr)
+        for idx, i in enumerate(to_compute):
+            row = examples[i]
+            logging.info("Grading index=%d (%d/%d)", i, idx + 1, len(to_compute))
+
+            result_tuple = grade_example_safe(i, row, eval_obj, sampler, skip_on_error, args.validate_node_contributions)
+            idx_result, single_result = result_tuple
+
+            if single_result is not None:
+                completed[i] = single_result
+                thread_safe_checkpoint_append(i, single_result, checkpoint_path, checkpoint_lock)
             else:
-                # Default mode: fail on error (safe checkpoint, can restart)
-                raise
+                # Error occurred and skip_on_error=True
+                skipped_grading_errors += 1
+
+            # Log progress
+            if log_interval > 0 and (idx + 1) % log_interval == 0:
+                try:
+                    log_grading_progress(str(checkpoint_path), len(completed), log_interval)
+                except Exception:
+                    pass
+    else:
+        # Threaded mode
+        done = 0
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            # Submit all jobs
+            futures = {
+                executor.submit(grade_example_safe, i, examples[i], eval_obj, sampler, skip_on_error, args.validate_node_contributions): i
+                for i in to_compute
+            }
+
+            # Process as completed
+            for future in as_completed(futures):
+                try:
+                    i, single_result = future.result()
+
+                    if single_result is not None:
+                        completed[i] = single_result
+                        thread_safe_checkpoint_append(i, single_result, checkpoint_path, checkpoint_lock)
+                    else:
+                        skipped_grading_errors += 1
+
+                    done += 1
+                    if done % 10 == 0 or done == len(to_compute):
+                        print(f"  {done}/{len(to_compute)} examples graded", file=sys.stderr)
+
+                    # Log progress if logging enabled
+                    if log_interval > 0 and done % log_interval == 0:
+                        try:
+                            log_grading_progress(str(checkpoint_path), len(completed), log_interval)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logging.error("Worker exception: %s", e)
+                    if not skip_on_error:
+                        raise
 
     if skipped_content_filter:
         print(f"Skipped {skipped_content_filter} examples due to content filter.", file=sys.stderr)
