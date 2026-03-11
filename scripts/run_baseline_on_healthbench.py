@@ -163,8 +163,8 @@ def main():
     parser.add_argument(
         "--n-workers",
         type=int,
-        default=1,
-        help="Number of parallel workers (default: 1). Set >1 for parallel evaluation.",
+        default=16,
+        help="Number of parallel workers (default: 16, optimized from testing; 1=sequential). Set >1 for parallel evaluation.",
     )
     parser.add_argument(
         "--limit",
