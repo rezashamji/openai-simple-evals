@@ -15,7 +15,7 @@ class ResponsesSampler(SamplerBase):
 
     def __init__(
         self,
-        model: str = "gpt-4.1",
+        model: str = "gpt-5.4",
         system_message: str | None = None,
         temperature: float = 0.5,
         max_tokens: int = 1024,
