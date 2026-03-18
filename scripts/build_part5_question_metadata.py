@@ -115,6 +115,7 @@ def extract_part4_metadata(grading_output: Dict[str, Any]) -> tuple[Optional[str
             'num_neutral_nodes': item.get('num_neutral_nodes'),
             'num_contradiction_nodes': item.get('num_contradiction_nodes'),
             'num_unclear_direction_nodes': item.get('num_unclear_direction_nodes'),
+            'total_nodes': item.get('total_nodes'),
             'contradiction_ratio': item.get('contradiction_ratio'),
             'mixed_signals': item.get('mixed_signals'),
 
