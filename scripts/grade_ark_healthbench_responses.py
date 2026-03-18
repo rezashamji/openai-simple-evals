@@ -77,6 +77,12 @@ def log_grading_progress(graded_jsonl, question_num, log_interval=10):
     sys.stdout.flush()
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+# Suppress verbose LiteLLM logging
+logging.getLogger("litellm").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+import litellm as _litellm_suppress
+_litellm_suppress.suppress_debug_info = True
 
 # Import from simple-evals package using relative imports
 # Run as: python -m simple_evals.scripts.grade_ark_healthbench_responses
@@ -86,6 +92,7 @@ from ..healthbench_eval import (  # type: ignore
     HEALTHBENCH_HTML_JINJA,
     HealthBenchEval,
     _aggregate_get_clipped_mean,
+    calculate_kg_relevance_score,
     get_usage_dict,
 )
 from ..sampler.precomputed_response_sampler import (  # type: ignore
@@ -106,11 +113,11 @@ class LiteLLMAzureGrader:
 
     def __init__(
         self,
-        model: str = "azure/gpt-4.1",
+        model: str = "azure/gpt-5.4",
         system_message: str | None = None,
         max_tokens: int = 2048,
         max_retries: int = 5,
-        retry_base_delay: float = 2.0,
+        retry_base_delay: float = 10.0,
     ):
         self.model = model
         self.system_message = system_message
@@ -135,6 +142,7 @@ class LiteLLMAzureGrader:
                     messages=message_list,
                     max_tokens=self.max_tokens,
                     timeout=60,
+                    num_retries=0,
                     api_key=api_key,
                     api_base=api_base,
                     api_version=api_version,
@@ -250,6 +258,10 @@ def grade_example_safe(i, row, eval_obj, sampler, skip_on_error, validate_node_c
         )
         score = metrics["overall_score"]
 
+        # Compute kg_relevance_score from Part 3/4 labels in rubric_items_with_grades
+        kg_labels = [{"kg_label": item.get("kg_label")} for item in rubric_items_with_grades] if rubric_items_with_grades else []
+        kg_relevance_score = calculate_kg_relevance_score(row["rubrics"], kg_labels)
+
         # Build HTML report
         html = common.jinja_env.from_string(
             HEALTHBENCH_HTML_JINJA.replace(
@@ -280,6 +292,7 @@ def grade_example_safe(i, row, eval_obj, sampler, skip_on_error, validate_node_c
                 "completion_id": hashlib.sha256(
                     (prompt_id + response_text).encode("utf-8")
                 ).hexdigest(),
+                "kg_relevance_score": kg_relevance_score,
                 "kg_reasoning_details": kg_reasoning_details,
                 "run_tag": run_tag,
                 "node_summaries": node_summaries,
@@ -416,7 +429,7 @@ def main():
 
     # --- Grader: same model as ARK (LiteLLM + AZURE_* env), same interface as ChatCompletionSampler ---
     grader = LiteLLMAzureGrader(
-        model="azure/gpt-4.1",
+        model="azure/gpt-5.4",
         system_message=OPENAI_SYSTEM_MESSAGE_API,
         max_tokens=2048,
     )
@@ -427,11 +440,13 @@ def main():
     stem = response_path.stem
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else out_dir / f"{stem}_grading_checkpoint.jsonl"
 
-    # --- HealthBenchEval loads its own examples from the eval jsonl; we tell it how many to use ---
-    # Order of examples is fixed by HealthBench (random.Random(0).sample), so Phase 1 must match.
+    # --- HealthBenchEval loads its own examples from the eval jsonl ---
+    # IMPORTANT: Pass num_examples=None to load ALL examples in file order (no rng.sample shuffle).
+    # Phase 1A uses examples[:limit] (file order), so grading must use the same file order.
+    # We grade only indices 0..num_responses-1 which aligns with Phase 1A's output.
     eval_obj = HealthBenchEval(
         grader_model=grader,
-        num_examples=num_examples,
+        num_examples=None,
         n_repeats=1,
         n_threads=args.n_threads,
         subset_name=None,
@@ -446,7 +461,7 @@ def main():
         print(f"Resuming: loaded {len(completed)} graded examples from {checkpoint_path}", file=sys.stderr)
 
     # --- Grade loop with checkpoint: process each example, skip cached, handle content-filter ---
-    examples = eval_obj.examples
+    examples = eval_obj.examples[:num_responses]  # Only grade indices matching Phase 1A output
     skipped_content_filter = 0
     skipped_grading_errors = 0
     log_interval = max(0, args.log_interval)  # 0 disables logging
