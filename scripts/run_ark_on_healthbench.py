@@ -26,6 +26,7 @@ Phase 1: Our only logic. Four steps total; we use two oracles and do minimal glu
 
 import argparse
 import json
+import logging
 import os
 import random
 import subprocess
@@ -33,6 +34,14 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+# Suppress LiteLLM verbose output (Provider List spam) in parent process
+import litellm as _litellm_init
+_litellm_init.suppress_debug_info = True
+os.environ["LITELLM_LOG"] = "ERROR"
+logging.getLogger("litellm").setLevel(logging.ERROR)
+logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
 
 
 def tail_jsonl(filepath, n=1):
@@ -181,7 +190,7 @@ def build_results_in_order(
     return results
 
 
-def nodes_to_nl(prompt: list, node_summaries: list, model_name: str = "azure/gpt-4.1") -> tuple[str, dict]:
+def nodes_to_nl(prompt: list, node_summaries: list, model_name: str = "azure/gpt-5.4") -> tuple[str, dict]:
     """Turn ARK's node summaries + full HealthBench conversation into response + track node contributions.
 
     Returns tuple of (response_text, node_contributions_dict) where:
@@ -254,33 +263,51 @@ Important:
     api_base = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get("AZURE_OPENAI_API_BASE") or os.environ.get("AZURE_API_BASE")
     api_version = os.environ.get("AZURE_OPENAI_API_VERSION") or os.environ.get("AZURE_API_VERSION")
 
-    try:
-        response = completion(
-            model=model_name,
-            messages=messages,
-            response_format={"type": "json_object"},
-            max_tokens=2048,
-            timeout=30,
-            api_key=api_key,
-            api_base=api_base,
-            api_version=api_version,
-        )
-        content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-        parsed = json.loads(content.strip())
+    import litellm as _litellm
+    from litellm.exceptions import RateLimitError
+    import time as _time
 
-        response_text = parsed.get("final_answer", "").strip()
-        node_contributions = parsed.get("node_contributions", {})
+    max_retries = 3
+    delay = 5
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            response = completion(
+                model=model_name,
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_tokens=2048,
+                timeout=30,
+                num_retries=0,
+                api_key=api_key,
+                api_base=api_base,
+                api_version=api_version,
+            )
+            content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            parsed = json.loads(content.strip())
 
-        return (response_text, node_contributions)
-    except Exception as e:
-        print(f"[nodes_to_nl ERROR] {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
-        if not api_key:
-            print(f"  WARNING: api_key is None/empty", file=sys.stderr)
-        if not api_base:
-            print(f"  WARNING: api_base is None/empty", file=sys.stderr)
-        if not api_version:
-            print(f"  WARNING: api_version is None/empty", file=sys.stderr)
-        return ("", {})
+            response_text = parsed.get("final_answer", "").strip()
+            node_contributions = parsed.get("node_contributions", {})
+
+            return (response_text, node_contributions)
+        except (RateLimitError, _litellm.Timeout) as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                print(f"[nodes_to_nl ERROR] {type(e).__name__} (attempt {attempt+1}/{max_retries}), retrying in {delay}s...", file=sys.stderr)
+                _time.sleep(delay)
+                delay *= 2
+            else:
+                print(f"[nodes_to_nl ERROR] {type(e).__name__} after {max_retries} attempts: {str(e)[:200]}", file=sys.stderr)
+                return ("", {})
+        except Exception as e:
+            print(f"[nodes_to_nl ERROR] {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+            if not api_key:
+                print(f"  WARNING: api_key is None/empty", file=sys.stderr)
+            if not api_base:
+                print(f"  WARNING: api_base is None/empty", file=sys.stderr)
+            if not api_version:
+                print(f"  WARNING: api_version is None/empty", file=sys.stderr)
+            return ("", {})
 
 
 def main():
@@ -290,10 +317,10 @@ def main():
     parser.add_argument("--ark-dir", type=str, required=True, help="Path to ARK repo (has benchmarks/stark/run_one_question.py).")
     parser.add_argument("--limit", type=int, default=None, help="Max number of examples (same order as HealthBench eval).")
     parser.add_argument("--python", type=str, default=None, help="Python for ARK subprocess (default: ark/.venv/bin/python).")
-    parser.add_argument("--nl-model", type=str, default="azure/gpt-4.1", help="Model for nodes→NL (default same as ARK).")
+    parser.add_argument("--nl-model", type=str, default="azure/gpt-5.4", help="Model for nodes→NL (default same as ARK).")
     parser.add_argument("--n-workers", type=int, default=16, help="Parallel workers for questions (default: 16, optimized from testing; 1=sequential). Speeds run without changing ARK method.")
     parser.add_argument("--graph-name", type=str, default="prime", help="ARK KG (e.g. prime). Pass when you run to make the run explicit.")
-    parser.add_argument("--ark-model", type=str, default="azure/gpt-4.1", help="ARK backbone. Pass when you run (e.g. azure/gpt-4.1).")
+    parser.add_argument("--ark-model", type=str, default="azure/gpt-5.4", help="ARK backbone. Pass when you run (e.g. azure/gpt-5.4).")
     parser.add_argument("--ark-agents", type=int, default=3, help="ARK parallel agents (paper A.2: n=3).")
     parser.add_argument("--ark-max-steps", type=int, default=20, help="ARK max steps per trajectory (paper A.2: Tmax=20).")
     parser.add_argument(
@@ -377,15 +404,27 @@ def main():
             embeddings_path = graph_dir / "embeddings_kalm.npy"
             if embeddings_path.exists():
                 cmd.extend(["--embeddings-path", str(embeddings_path)])
+        _RATE_LIMIT_PATTERNS = ("RateLimitReached", "RateLimitError", "429")
+        _ark_delay = 30
+        result = None
         try:
-            result = subprocess.run(
-                cmd,
-                cwd=str(stark_dir),
-                capture_output=True,
-                text=True,
-                timeout=1200,
-                env={**os.environ},
-            )
+            for _attempt in range(3):
+                result = subprocess.run(
+                    cmd,
+                    cwd=str(stark_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=1200,
+                    env={**os.environ, "LITELLM_LOG": "ERROR"},
+                )
+                if result.returncode == 0:
+                    break
+                is_rate_limit = any(p in result.stderr for p in _RATE_LIMIT_PATTERNS)
+                if is_rate_limit and _attempt < 2:
+                    print(f"[ARK_RATELIMIT] attempt {_attempt+1}/3, retrying in {_ark_delay}s...", file=sys.stderr)
+                    import time as _t; _t.sleep(_ark_delay); _ark_delay *= 2
+                else:
+                    break
         finally:
             Path(q_file).unlink(missing_ok=True)
         # Initialize defaults for failure cases
@@ -396,37 +435,33 @@ def main():
         if result.returncode != 0:
             if args.search_mode != "bm25":
                 print(f"[ARK_ERROR] search_mode={args.search_mode} returncode={result.returncode}", file=sys.stderr)
-                print(f"[ARK_STDERR]\n{result.stderr}", file=sys.stderr)
+                _NOISE = ("Provider List", "Give Feedback", "LiteLLM.Info", "Loading weights")
+                filtered = [l for l in result.stderr.split('\n')
+                            if l.strip() and not any(p in l for p in _NOISE)]
+                if filtered:
+                    print(f"[ARK_STDERR]\n" + "\n".join(filtered[:20]), file=sys.stderr)
             pass  # Defaults remain empty
         else:
-            # Log subprocess output for embedding/hybrid modes (for debugging)
-            if args.search_mode != "bm25" and result.stderr:
-                print(f"[ARK_DEBUG] search_mode={args.search_mode} subprocess stderr:", file=sys.stderr)
-                stderr_lines = result.stderr.split('\n')
-                # Log lines with EMBEDDING_DEBUG or RRF_DEBUG prefix or first/last 10 lines
-                debug_lines = [l for l in stderr_lines if 'EMBEDDING_DEBUG' in l or 'RRF_DEBUG' in l]
-                if debug_lines:
-                    for line in debug_lines[:50]:  # First 50 debug lines (more for RRF output)
+            # Log unexpected stderr from subprocess, filtering known benign noise
+            if result.stderr:
+                stderr_lines = [l for l in result.stderr.split('\n')
+                                if l.strip()
+                                and 'Provider List' not in l
+                                and 'Loading weights' not in l]
+                if stderr_lines:
+                    print(f"[ARK subprocess stderr]", file=sys.stderr)
+                    for line in stderr_lines[:10]:
                         print(f"  {line}", file=sys.stderr)
-                else:
-                    # If no debug output, log first and last few lines to see what happened
-                    for line in stderr_lines[:5]:
-                        if line.strip():
-                            print(f"  {line}", file=sys.stderr)
-                    if len(stderr_lines) > 10:
-                        print(f"  ...", file=sys.stderr)
-                        for line in stderr_lines[-5:]:
-                            if line.strip():
-                                print(f"  {line}", file=sys.stderr)
 
             try:
-                ark_out = json.loads(result.stdout.strip())
+                # Strip leading noise (e.g. LiteLLM "Provider List" prints) before JSON
+                stdout_clean = result.stdout
+                json_start = stdout_clean.find('{')
+                if json_start > 0:
+                    stdout_clean = stdout_clean[json_start:]
+                ark_out = json.loads(stdout_clean.strip())
             except json.JSONDecodeError:
-                if args.search_mode != "bm25":
-                    print(f"[ARK_PARSE_ERROR] Failed to parse JSON from subprocess for search_mode={args.search_mode}", file=sys.stderr)
-                    print(f"  stdout length: {len(result.stdout)}", file=sys.stderr)
-                    if result.stdout:
-                        print(f"  stdout preview: {result.stdout[:200]}", file=sys.stderr)
+                print(f"[ARK_PARSE_ERROR] Failed to parse JSON from subprocess for search_mode={args.search_mode}", file=sys.stderr)
                 pass  # Defaults remain empty
             else:
                 if ark_out.get("error"):
