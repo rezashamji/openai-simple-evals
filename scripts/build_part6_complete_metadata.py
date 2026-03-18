@@ -273,6 +273,7 @@ def build_phase5_section(p2a: Dict, p2b: Dict, p5: Dict) -> Dict:
 
     return {
         "num_criteria": p5.get("num_criteria", len(per_criterion)),
+        "kg_relevance_score": p2a.get("example_level_metadata", {}).get("kg_relevance_score"),
         "kg_influence_summary": p5.get("kg_influence_summary", {}),
         "kg_helped_confidence_breakdown": p5.get("kg_helped_confidence_breakdown", {}),
         "kg_hurt_confidence_breakdown": p5.get("kg_hurt_confidence_breakdown", {}),
@@ -314,8 +315,8 @@ def main():
     print("Loading input files...", file=sys.stderr)
     phase1_kg = load_jsonl(args.phase1_kg)
     phase1_baseline = load_jsonl(args.phase1_baseline)
-    phase2a_grading = load_jsonl(args.phase2a_grading)
-    phase2b_grading = load_jsonl(args.phase2b_grading)
+    phase2a_grading = sorted(load_jsonl(args.phase2a_grading), key=lambda x: x.get("index", 0))
+    phase2b_grading = sorted(load_jsonl(args.phase2b_grading), key=lambda x: x.get("index", 0))
     phase5_analysis = load_jsonl(args.phase5_analysis)
 
     print(f"Loaded {len(phase1_kg)} questions from phase1_kg", file=sys.stderr)
