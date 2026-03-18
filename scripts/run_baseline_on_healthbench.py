@@ -16,7 +16,7 @@ Usage:
     python run_baseline_on_healthbench.py \\
         --examples-jsonl data/healthbench_examples.jsonl \\
         --output-path responses_no_kg.jsonl \\
-        --model gpt-4-turbo
+        --model gpt-5.4
 """
 
 import argparse
@@ -25,6 +25,9 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+import litellm as _litellm_suppress
+_litellm_suppress.suppress_debug_info = True
 
 
 def load_completed_by_prompt_id(output_path: Path) -> dict[str, dict]:
@@ -51,11 +54,11 @@ def load_completed_by_prompt_id(output_path: Path) -> dict[str, dict]:
 
 def call_gpt_baseline(
     prompt: list,
-    model_name: str = "azure/gpt-4.1",
+    model_name: str = "azure/gpt-5.4",
     max_retries: int = 3,
 ) -> str:
     """
-    Call GPT-4.1 directly via litellm for baseline (no KG, no ARK).
+    Call GPT-5.4 directly via litellm for baseline (no KG, no ARK).
 
     Returns: response_text (clean string)
     Uses AZURE_* env vars (same as ARK nodes_to_nl).
@@ -80,6 +83,7 @@ def call_gpt_baseline(
                 messages=messages,
                 max_tokens=2048,
                 timeout=30,
+                num_retries=0,
                 api_key=api_key,
                 api_base=api_base,
                 api_version=api_version,
@@ -90,16 +94,16 @@ def call_gpt_baseline(
             if response_text:
                 return response_text
             elif attempt < max_retries - 1:
-                print(f"Warning: Empty response from GPT-4.1, retrying (attempt {attempt + 1}/{max_retries})...", file=sys.stderr)
+                print(f"Warning: Empty response from GPT-5.4, retrying (attempt {attempt + 1}/{max_retries})...", file=sys.stderr)
                 continue
             else:
                 return ""
 
         except Exception as e:
             if attempt < max_retries - 1:
-                print(f"Warning: GPT-4.1 call failed (attempt {attempt + 1}/{max_retries}): {e}", file=sys.stderr)
+                print(f"Warning: GPT-5.4 call failed (attempt {attempt + 1}/{max_retries}): {e}", file=sys.stderr)
             else:
-                print(f"Error: GPT-4.1 call failed after {max_retries} attempts: {e}", file=sys.stderr)
+                print(f"Error: GPT-5.4 call failed after {max_retries} attempts: {e}", file=sys.stderr)
                 return ""
 
     return ""
@@ -140,7 +144,7 @@ def build_phase1_dict(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Baseline (no-KG) runner: calls GPT-4.1 directly via litellm. Phase 1 schema output. Supports resuming from checkpoint."
+        description="Baseline (no-KG) runner: calls GPT-5.4 directly via litellm. Phase 1 schema output. Supports resuming from checkpoint."
     )
     parser.add_argument(
         "--examples-jsonl",
@@ -157,8 +161,8 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="azure/gpt-4.1",
-        help="Model to use for baseline (default: azure/gpt-4.1, passed to litellm).",
+        default="azure/gpt-5.4",
+        help="Model to use for baseline (default: azure/gpt-5.4, passed to litellm).",
     )
     parser.add_argument(
         "--n-workers",
@@ -210,10 +214,10 @@ def main():
     if not to_compute:
         print(f"All {len(examples)} examples already completed. Skipping evaluation.", file=sys.stderr)
     else:
-        print(f"Running GPT-4.1 baseline on {len(to_compute)} remaining examples (no KG)...", file=sys.stderr)
+        print(f"Running GPT-5.4 baseline on {len(to_compute)} remaining examples (no KG)...", file=sys.stderr)
 
         def process_one(idx: int) -> tuple[int, dict]:
-            """Call GPT-4.1 for one example. Returns (idx, phase1_dict)."""
+            """Call GPT baseline model for one example. Returns (idx, phase1_dict)."""
             example = examples[idx]
             prompt_id = example.get("prompt_id", str(idx))
             prompt = example.get("prompt", [])
