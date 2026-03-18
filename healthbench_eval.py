@@ -559,7 +559,7 @@ class HealthBenchEval(Eval):
         node_summaries: list[dict] | None = None,
         run_tag: str = "no_kg",
         validate_node_contributions: bool = False,
-    ) -> tuple[dict, str, list[dict], dict]:
+    ) -> tuple[dict, str, list[dict], dict, dict]:
         # construct and grade the sample
         convo_with_response = prompt + [dict(content=response_text, role="assistant")]
 
@@ -661,7 +661,7 @@ class HealthBenchEval(Eval):
                         node_summary=node_summary.get("summary", ""),
                         initial_contributed=node_contrib.get("contributed", False),
                         initial_contribution_explanation=node_contrib.get("explanation", ""),
-                        model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-4.1",
+                        model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-5.4",
                     )
                     # Add node_id to Part 2 output for downstream tracking
                     node_part2["node_id"] = node_id
@@ -708,7 +708,7 @@ class HealthBenchEval(Eval):
                             criteria_met=grading_response["criteria_met"],
                             points=rubric_item.points,
                             grading_explanation=grading_response.get("explanation", ""),
-                            model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-4.1",
+                            model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-5.4",
                         )
                         criterion_data["node_labels"].append({
                             "node_id": node_part2["node_id"],
@@ -765,7 +765,50 @@ class HealthBenchEval(Eval):
                     criterion_data["contradiction_ratio"] = 0.0
                     criterion_data["mixed_signals"] = False
 
-                # Step 4.2: Assign KG influence label
+                # Step 4.5: High contradiction analysis (must run BEFORE 4.2)
+                if criterion_data.get("contradiction_ratio", 0.0) >= 0.25:
+                    try:
+                        part4_5_result = kg_node_validation_part2.step_4_5_analyze_high_contradictions(
+                            criterion_statement=criterion_data.get("criterion_statement", ""),
+                            criteria_met=criterion_data.get("criteria_met", False),
+                            grading_explanation=criterion_data.get("grading_explanation", ""),
+                            response_text=response_text,
+                            node_summaries=node_summaries,
+                            node_contributions=node_contributions,
+                            num_helped_nodes=criterion_data.get("num_helped_nodes", 0),
+                            num_hurt_nodes=criterion_data.get("num_hurt_nodes", 0),
+                            num_contradiction_nodes=criterion_data.get("num_contradiction_nodes", 0),
+                            contradiction_ratio=criterion_data.get("contradiction_ratio", 0.0),
+                            model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-5.4",
+                        )
+                        criterion_data["high_contradiction_label_consistency"] = part4_5_result.get("high_contradiction_label_consistency")
+                        criterion_data["high_contradiction_resolution_insight"] = part4_5_result.get("high_contradiction_resolution_insight")
+                        criterion_data["high_contradiction_consistency_reasoning"] = part4_5_result.get("high_contradiction_consistency_reasoning")
+                    except Exception as e:
+                        logger.warning(f"Part 4.5 failed for criterion {criterion_idx}: {e}")
+
+                # Step 4.7: Conflicting signals analysis (must run BEFORE 4.2)
+                if criterion_data.get("mixed_signals", False):
+                    try:
+                        part4_7_result = kg_node_validation_part2.step_4_7_analyze_conflicting_signals(
+                            criterion_statement=criterion_data.get("criterion_statement", ""),
+                            criteria_met=criterion_data.get("criteria_met", False),
+                            grading_explanation=criterion_data.get("grading_explanation", ""),
+                            response_text=response_text,
+                            node_summaries=node_summaries,
+                            node_contributions=node_contributions,
+                            num_helped_nodes=criterion_data.get("num_helped_nodes", 0),
+                            num_hurt_nodes=criterion_data.get("num_hurt_nodes", 0),
+                            model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-5.4",
+                        )
+                        criterion_data["conflicting_signals_label_consistency"] = part4_7_result.get("conflicting_signals_label_consistency")
+                        criterion_data["conflicting_signals_weighting"] = part4_7_result.get("conflicting_signals_weighting")
+                        criterion_data["conflicting_signals_dominant_influence"] = part4_7_result.get("conflicting_signals_dominant_influence")
+                        criterion_data["conflicting_signals_consistency_reasoning"] = part4_7_result.get("conflicting_signals_consistency_reasoning")
+                    except Exception as e:
+                        logger.warning(f"Part 4.7 failed for criterion {criterion_idx}: {e}")
+
+                # Step 4.2: Assign KG influence label (runs AFTER 4.5 and 4.7 so their outputs are available)
                 try:
                     part4_2_result = kg_node_validation_part2.step_4_2_assign_kg_influence_label(
                         num_helped_nodes=criterion_data.get("num_helped_nodes", 0),
@@ -796,37 +839,6 @@ class HealthBenchEval(Eval):
                     criterion_data["confidence_level"] = "LOW"
                     criterion_data["confidence_reasoning"] = f"Error in confidence calc: {str(e)}"
 
-                # Step 4.5: High contradiction analysis (if contradiction_ratio >= 0.25)
-                if criterion_data.get("contradiction_ratio", 0.0) >= 0.25:
-                    try:
-                        part4_5_result = kg_node_validation_part2.step_4_5_analyze_high_contradictions(
-                            node_criterion_labels=node_criterion_labels,
-                            criterion_statement=criterion_data.get("criterion_statement", ""),
-                            grading_explanation=criterion_data.get("grading_explanation", ""),
-                            model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-4.1",
-                        )
-                        criterion_data["high_contradiction_label_consistency"] = part4_5_result.get("high_contradiction_label_consistency")
-                        criterion_data["high_contradiction_resolution_insight"] = part4_5_result.get("high_contradiction_resolution_insight")
-                        criterion_data["high_contradiction_consistency_reasoning"] = part4_5_result.get("high_contradiction_consistency_reasoning")
-                    except Exception as e:
-                        logger.warning(f"Part 4.5 failed for criterion {criterion_idx}: {e}")
-
-                # Step 4.7: Conflicting signals analysis (if mixed_signals = True)
-                if criterion_data.get("mixed_signals", False):
-                    try:
-                        part4_7_result = kg_node_validation_part2.step_4_7_analyze_conflicting_signals(
-                            node_criterion_labels=node_criterion_labels,
-                            criterion_statement=criterion_data.get("criterion_statement", ""),
-                            grading_explanation=criterion_data.get("grading_explanation", ""),
-                            model=self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-4.1",
-                        )
-                        criterion_data["conflicting_signals_label_consistency"] = part4_7_result.get("conflicting_signals_label_consistency")
-                        criterion_data["conflicting_signals_weighting"] = part4_7_result.get("conflicting_signals_weighting")
-                        criterion_data["conflicting_signals_dominant_influence"] = part4_7_result.get("conflicting_signals_dominant_influence")
-                        criterion_data["conflicting_signals_consistency_reasoning"] = part4_7_result.get("conflicting_signals_consistency_reasoning")
-                    except Exception as e:
-                        logger.warning(f"Part 4.7 failed for criterion {criterion_idx}: {e}")
-
                 # For backward compatibility: set kg_label and kg_reasoning based on kg_influence_label
                 kg_label = criterion_data.get("kg_influence_label", "KG_NEUTRAL")
                 if kg_label.startswith("KG_HELPED"):
@@ -853,9 +865,11 @@ class HealthBenchEval(Eval):
                         "num_neutral_nodes": criterion_data.get("num_neutral_nodes"),
                         "num_contradiction_nodes": criterion_data.get("num_contradiction_nodes"),
                         "num_unclear_direction_nodes": criterion_data.get("num_unclear_direction_nodes"),
+                        "total_nodes": criterion_data.get("total_nodes"),
                         "contradiction_ratio": criterion_data.get("contradiction_ratio"),
                         "mixed_signals": criterion_data.get("mixed_signals"),
                         # Part 4.2 fields
+                        "kg_label": criterion_data.get("kg_label"),
                         "kg_influence_label": criterion_data.get("kg_influence_label"),
                         "assignment_reason": criterion_data.get("assignment_reason"),
                         # Part 4.3 fields
@@ -901,11 +915,6 @@ class HealthBenchEval(Eval):
             kg_reasoning_details = {}
             kg_labels = [{"kg_label": None, "kg_reasoning": None}] * len(rubric_items)
 
-        # Add kg_relevance_score to metrics dict for aggregation (Step 5 Part B)
-        kg_relevance_score_for_metrics = calculate_kg_relevance_score(rubric_items, kg_labels)
-        if kg_relevance_score_for_metrics is not None:
-            metrics["kg_relevance_score"] = kg_relevance_score_for_metrics
-
         # Return per_node_metadata and per_criterion_metadata for complete auditability
         # These are intermediate Part 2-3 outputs needed for training predictors
         intermediate_metadata = {
@@ -932,7 +941,7 @@ class HealthBenchEval(Eval):
                 )
                 response_usage = response_dict.get("usage", None)
 
-            metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details = (
+            metrics, readable_explanation_str, rubric_items_with_grades, kg_reasoning_details, intermediate_metadata = (
                 self.grade_sample(
                     prompt=actual_queried_prompt_messages,
                     response_text=response_text,
@@ -1044,7 +1053,7 @@ def physician_completions_main(
     date_str = now.strftime("%Y%m%d_%H%M")
 
     grading_sampler = ChatCompletionSampler(
-        model="gpt-4.1-2025-04-14",
+        model="gpt-5.4",
         system_message=OPENAI_SYSTEM_MESSAGE_API,
         max_tokens=2048,
     )
