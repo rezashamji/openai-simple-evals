@@ -3,7 +3,8 @@ set -e
 
 ################################################################################
 # llm_healthbench.sh
-# Baseline-only pipeline: Phase 1B (Baseline) + Phase 2B + Part 5 + 6
+# BASELINE-ONLY PIPELINE (NO KG)
+# Pipeline: Phase 1B (Baseline) + Phase 2B + Part 5 + 6
 ################################################################################
 
 # Color codes for output
@@ -13,26 +14,27 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 ################################################################################
-# ARGUMENT VALIDATION
+# CONFIGURATION - EDIT THESE OR PASS AS COMMAND-LINE ARGUMENTS
 ################################################################################
 
-if [ $# -lt 4 ]; then
-    echo -e "${RED}Usage:${NC}"
-    echo "  bash llm_healthbench.sh <OUTPUT_DIR> <LLM_MODEL> <LIMIT> <INPUT_JSONL>"
-    echo ""
-    echo "Example:"
-    echo "  bash llm_healthbench.sh \\"
-    echo "    /results/5000q_sweeps_mar10/run_002_gpt41_optimus_hybrid_baseline \\"
-    echo "    'azure/gpt-4.1' \\"
-    echo "    5000 \\"
-    echo "    /data/2025-05-07-06-14-12_oss_eval.jsonl"
-    exit 1
-fi
+# If command-line args provided, use them; otherwise use defaults below
+if [ $# -ge 4 ]; then
+    # Command-line mode (for wrapper scripts calling this directly)
+    OUTPUT_DIR="$1"
+    LLM_MODEL="$2"
+    LIMIT="$3"
+    INPUT_JSONL="$4"
+else
+    # Editable config mode (for direct sbatch submission)
+    LLM_MODEL="azure/gpt-5.4"                                           # Change this
+    LIMIT=5000                                                          # Change this
+    INPUT_JSONL="/n/holylfs06/LABS/mzitnik_lab/Users/rshamji/rshamji/simple-evals/2025-05-07-06-14-12_oss_eval.jsonl"
+    BASE_OUTPUT_DIR="/n/holylfs06/LABS/mzitnik_lab/Users/rshamji/rshamji/simple-evals/results/arkplus_evals"
 
-OUTPUT_DIR="$1"
-LLM_MODEL="$2"
-LIMIT="$3"
-INPUT_JSONL="$4"
+    # Auto-generate folder name: MODEL_baseline_standalone (for standalone baseline runs)
+    MODEL_FOLDER=$(echo "$LLM_MODEL" | sed 's/.*\///; s/\./-/g; s/-//')
+    OUTPUT_DIR="$BASE_OUTPUT_DIR/${MODEL_FOLDER}_baseline_standalone"
+fi
 
 # Defaults
 VENV_PYTHON="${VENV_PYTHON:-python}"
@@ -53,6 +55,21 @@ mkdir -p "$OUTPUT_DIR"
 PROJECT_ROOT=$(dirname "$VENV_PYTHON")/../../..
 cd "$PROJECT_ROOT"
 
+# Setup audit logging
+AUDIT_FILE="${OUTPUT_DIR}/run_audit.jsonl"
+SLURM_JOB_ID=${SLURM_JOB_ID:-"manual"}
+
+# Helper function to log to audit file
+log_audit() {
+    local phase=$1
+    local event=$2
+    local status=$3
+    local extra=$4
+
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    echo "{\"job_id\": \"$SLURM_JOB_ID\", \"phase\": \"$phase\", \"event\": \"$event\", \"status\": \"$status\", \"timestamp\": \"$timestamp\"$extra}" >> "$AUDIT_FILE"
+}
+
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${BLUE}BASELINE-ONLY PIPELINE${NC}"
 echo -e "${BLUE}Model: ${LLM_MODEL} | Limit: ${LIMIT}${NC}"
@@ -68,22 +85,33 @@ echo ""
 
 PHASE1B_OUTPUT="${OUTPUT_DIR}/phase1b_baseline_responses.jsonl"
 
-$VENV_PYTHON -m simple_evals.scripts.run_baseline_on_healthbench \
-    --input-jsonl "$INPUT_JSONL" \
-    --output-jsonl "$PHASE1B_OUTPUT" \
-    --llm-model "$LLM_MODEL" \
-    --limit "$LIMIT" \
-    --run-tag "baseline" \
-    --log-interval 1 \
-    2>&1 | tee "${OUTPUT_DIR}/phase1b_baseline.log"
+# Skip Phase 1B if already completed
+if [ -f "$PHASE1B_OUTPUT" ]; then
+    PHASE1B_LINES=$(wc -l < "$PHASE1B_OUTPUT")
+    echo -e "${GREEN}✓ Phase 1B already complete: ${PHASE1B_LINES} questions (skipping)${NC}"
+    log_audit "1b" "skipped" "success" ", \"reason\": \"output file exists\", \"lines\": $PHASE1B_LINES"
+else
+    log_audit "1b" "start" "in_progress" ""
 
-if [ $? -ne 0 ]; then
-    echo -e "${RED}✗ Phase 1B FAILED${NC}"
-    exit 1
+    $VENV_PYTHON -m simple_evals.scripts.run_baseline_on_healthbench \
+        --examples-jsonl "$INPUT_JSONL" \
+        --output-path "$PHASE1B_OUTPUT" \
+        --model "$LLM_MODEL" \
+        --n-workers 16 \
+        --limit "$LIMIT" \
+        2>&1 | tee "${OUTPUT_DIR}/phase1b_baseline.log"
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}✗ Phase 1B FAILED${NC}"
+        PHASE1B_LINES=$(wc -l < "$PHASE1B_OUTPUT" 2>/dev/null || echo 0)
+        log_audit "1b" "end" "failed" ", \"lines_written\": $PHASE1B_LINES"
+        exit 1
+    fi
+
+    PHASE1B_LINES=$(wc -l < "$PHASE1B_OUTPUT")
+    echo -e "${GREEN}✓ Phase 1B complete: ${PHASE1B_LINES} questions${NC}"
+    log_audit "1b" "end" "success" ", \"lines_written\": $PHASE1B_LINES"
 fi
-
-PHASE1B_LINES=$(wc -l < "$PHASE1B_OUTPUT")
-echo -e "${GREEN}✓ Phase 1B complete: ${PHASE1B_LINES} questions${NC}"
 echo ""
 
 ################################################################################
@@ -93,61 +121,27 @@ echo ""
 echo -e "${BLUE}PHASE 2B: GRADE BASELINE RESPONSES${NC}"
 echo ""
 
+log_audit "2b" "start" "in_progress" ""
+
 $VENV_PYTHON -m simple_evals.scripts.grade_ark_healthbench_responses \
     --responses-jsonl "$PHASE1B_OUTPUT" \
     --output-dir "$OUTPUT_DIR" \
     --examples "$LIMIT" \
     --n-workers-phase2a 4 \
     --skip-on-error \
-    --log-interval 1 \
+    --log-interval 100 \
     2>&1 | tee "${OUTPUT_DIR}/phase2b_baseline.log"
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}✗ Phase 2B FAILED${NC}"
+    CHECKPOINT_LINES=$(wc -l < "${OUTPUT_DIR}/phase1b_baseline_responses_grading_checkpoint.jsonl" 2>/dev/null || echo 0)
+    log_audit "2b" "end" "failed" ", \"checkpoint_lines\": $CHECKPOINT_LINES, \"expected_lines\": $LIMIT"
     exit 1
 fi
 
+CHECKPOINT_LINES=$(wc -l < "${OUTPUT_DIR}/phase1b_baseline_responses_grading_checkpoint.jsonl" 2>/dev/null || echo 0)
 echo -e "${GREEN}✓ Phase 2B complete${NC}"
-echo ""
-
-################################################################################
-# PART 5: AGGREGATE TO QUESTION LEVEL
-################################################################################
-
-echo -e "${BLUE}PART 5: QUESTION-LEVEL AGGREGATION${NC}"
-echo ""
-
-$VENV_PYTHON -m simple_evals.scripts.build_part5_question_metadata \
-    --output-dir "$OUTPUT_DIR" \
-    --limit "$LIMIT" \
-    2>&1 | tee "${OUTPUT_DIR}/part5_build.log"
-
-if [ $? -ne 0 ]; then
-    echo -e "${RED}✗ Part 5 FAILED${NC}"
-    exit 1
-fi
-
-echo -e "${GREEN}✓ Part 5 complete${NC}"
-echo ""
-
-################################################################################
-# PART 6: MERGE ALL PHASES
-################################################################################
-
-echo -e "${BLUE}PART 6: MERGE ALL PHASES (FINAL OUTPUT)${NC}"
-echo ""
-
-$VENV_PYTHON -m simple_evals.scripts.build_part6_complete_metadata \
-    --output-dir "$OUTPUT_DIR" \
-    --limit "$LIMIT" \
-    2>&1 | tee "${OUTPUT_DIR}/part6_build.log"
-
-if [ $? -ne 0 ]; then
-    echo -e "${RED}✗ Part 6 FAILED${NC}"
-    exit 1
-fi
-
-echo -e "${GREEN}✓ Part 6 complete${NC}"
+log_audit "2b" "end" "success" ", \"graded_lines\": $CHECKPOINT_LINES"
 echo ""
 
 ################################################################################
@@ -155,7 +149,7 @@ echo ""
 ################################################################################
 
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}✓ BASELINE PIPELINE COMPLETE${NC}"
+echo -e "${GREEN}✓ BASELINE PIPELINE COMPLETE (Phase 1B + 2B)${NC}"
 echo -e "${BLUE}Output: ${OUTPUT_DIR}${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
