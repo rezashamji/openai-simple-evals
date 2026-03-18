@@ -249,8 +249,6 @@ class KGEmbedder:
             [(node_id, type, summary, fused_score, metadata_dict), ...]
             where metadata contains: embedding_rank, bm25_rank, embedding_score, bm25_score
         """
-        print(f"[RRF_DEBUG] Starting RRF fusion with {len(embedding_results)} embedding results, {len(bm25_results)} BM25 results", flush=True, file=sys.stderr)
-
         # Create lookup: node_id -> (rank, score) for each method
         embedding_lookup = {
             result[0]: (rank + 1, result[3])
@@ -260,11 +258,6 @@ class KGEmbedder:
             result[0]: (rank + 1, result[3])
             for rank, result in enumerate(bm25_results)
         }
-
-        if embedding_results:
-            print(f"[RRF_DEBUG] First embedding result: {embedding_results[0]}", flush=True, file=sys.stderr)
-        if bm25_results:
-            print(f"[RRF_DEBUG] First BM25 result: {bm25_results[0]}", flush=True, file=sys.stderr)
 
         # Collect all unique nodes from both searches
         all_nodes = set(embedding_lookup.keys()) | set(bm25_lookup.keys())
@@ -300,7 +293,7 @@ class KGEmbedder:
             node_id_str = str(node_id)
             matches = self.nodes_df[self.nodes_df["name"] == node_id_str]
             if len(matches) == 0:
-                print(f"[RRF_DEBUG] Node not found in RRF: {node_id_str} (type: {type(node_id)}). Available sample: {list(self.nodes_df['name'].head(3).values)}", flush=True, file=sys.stderr)
+                continue  # skip nodes not found in dataframe
                 continue
             node = matches.iloc[0]
             results.append(
