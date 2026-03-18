@@ -12,9 +12,13 @@ All LLM calls use strict JSON output with validation.
 
 import json
 import logging
+import time
 from typing import Optional
 
 import litellm
+from litellm.exceptions import RateLimitError
+
+litellm.drop_params = True  # Allow unsupported params (e.g., temperature) to be dropped for models like gpt-5
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +123,7 @@ def call_llm_with_validation(
     template: str,
     replacements: dict[str, str],
     expected_keys: list[str],
-    model: str = "gpt-4-turbo",
+    model: str = "azure/gpt-5.4",
 ) -> dict:
     """
     Call LLM with template substitution and strict JSON validation.
@@ -142,18 +146,29 @@ def call_llm_with_validation(
         prompt = prompt.replace(f"<<{key}>>", str(value))
 
     # Call LLM with response_format to guarantee valid JSON
-    response = litellm.completion(
-        model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.7,
-        max_tokens=500,
-    )
+    max_retries = 5
+    delay = 15
+    for attempt in range(max_retries):
+        try:
+            response = litellm.completion(
+                model=model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.7,
+                max_tokens=500,
+                num_retries=0,
+            )
+            break
+        except RateLimitError:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
 
     response_text = response.choices[0].message.content
     logger.debug(f"LLM response: {response_text}")
@@ -170,7 +185,7 @@ def call_llm_with_validation(
 def step_2_1_validate_node_content(
     response_text: str,
     node_summary: str,
-    model: str = "gpt-4-turbo",
+    model: str = "azure/gpt-5.4",
 ) -> dict:
     """
     Step 2.1: Check if node content appears in response.
@@ -239,7 +254,7 @@ def step_2_3_judge_conflict(
     initial_contributed: bool,
     initial_contribution_explanation: str,
     node_content_appears: bool,
-    model: str = "gpt-4-turbo",
+    model: str = "azure/gpt-5.4",
 ) -> dict:
     """
     Step 2.3: Judge LLM for contribution conflicts.
@@ -389,7 +404,7 @@ def process_node_part2(
     node_summary: str,
     initial_contributed: bool,
     initial_contribution_explanation: str,
-    model: str = "gpt-4-turbo",
+    model: str = "azure/gpt-5.4",
 ) -> dict:
     """
     Process a single node through Part 2 (Steps 2.1-2.4).
@@ -405,7 +420,7 @@ def process_node_part2(
     Returns:
         Dict with all Part 2 outputs (content check, conflict, judge, resolution)
     """
-    logger.info(f"Part 2 processing node {node_index}")
+    logger.debug(f"Part 2 processing node {node_index}")
 
     # Step 2.1: Content validation
     content_check = step_2_1_validate_node_content(
@@ -550,7 +565,7 @@ def step_3_1_2_check_grading_justification(
     grading_explanation: str,
     node_summary: str,
     node_contribution_explanation: str,
-    model: str = "gpt-4-turbo",
+    model: str = "azure/gpt-5.4",
 ) -> dict:
     """
     Step 3.1.2: Check if node is used as justification in grading explanation.
@@ -615,7 +630,7 @@ def step_3_1_4_analyze_node_direction(
     grading_explanation: str,
     node_summary: str,
     node_contribution_explanation: str,
-    model: str = "gpt-4-turbo",
+    model: str = "azure/gpt-5.4",
 ) -> dict:
     """
     Step 3.1.4: Analyze node direction relative to criterion outcome.
@@ -736,7 +751,7 @@ def process_node_criterion_pair_part3(
     criteria_met: bool,
     points: int,
     grading_explanation: str,
-    model: str = "gpt-4-turbo",
+    model: str = "azure/gpt-5.4",
 ) -> dict:
     """
     Process a single (node, criterion) pair through Part 3 (Steps 3.1.1-3.1.6).
@@ -755,7 +770,7 @@ def process_node_criterion_pair_part3(
     Returns:
         Dict with all Part 3 outputs (node_used_as_justification, direction, final_label)
     """
-    logger.info(f"Part 3 processing (node={node_index}, criterion={criterion_statement[:50]}...)")
+    logger.debug(f"Part 3 processing (node={node_index}, criterion={criterion_statement[:50]}...)")
 
     # Step 3.1.1: Check if contributed
     label = step_3_1_1_check_contributed(final_contributed)
@@ -911,6 +926,7 @@ def step_4_1_count_labels(node_criterion_labels: list[dict]) -> dict:
         "num_neutral_nodes": num_neutral_nodes,
         "num_contradiction_nodes": num_contradiction_nodes,
         "num_unclear_direction_nodes": num_unclear_direction_nodes,
+        "total_nodes": total_nodes,
         "contradiction_ratio": contradiction_ratio,
         "mixed_signals": mixed_signals,
     }
@@ -939,6 +955,7 @@ def step_4_2_assign_kg_influence_label(
     contradiction_ratio: float,
     mixed_signals: bool,
     conflicting_signals_label_consistency: Optional[str] = None,
+    conflicting_signals_dominant_influence: Optional[str] = None,
     high_contradiction_label_consistency: Optional[str] = None,
 ) -> dict:
     """
@@ -1016,7 +1033,6 @@ def step_4_2_assign_kg_influence_label(
             )
             conflicting_signals_label_consistency = "UNCLEAR"
 
-        if conflicting_signals_label_consistency == "CONSISTENT":
             # LLM explained which signal won out
             if num_helped_nodes > num_hurt_nodes:
                 return {
@@ -1192,7 +1208,7 @@ def step_4_5_analyze_high_contradictions(
     num_hurt_nodes: int,
     num_contradiction_nodes: int,
     contradiction_ratio: float,
-    model: str = "gpt-4-turbo",
+    model: str = "azure/gpt-5.4",
 ) -> dict:
     """
     Part 4.5: Analyze high contradiction cases where diagnostic labels dominate.
@@ -1326,7 +1342,7 @@ def step_4_7_analyze_conflicting_signals(
     node_contributions: dict,
     num_helped_nodes: int,
     num_hurt_nodes: int,
-    model: str = "gpt-4-turbo",
+    model: str = "azure/gpt-5.4",
 ) -> dict:
     """
     Part 4.7: Analyze cases where both HELPED and HURT nodes are cited in grading.
