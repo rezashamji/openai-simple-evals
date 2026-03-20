@@ -267,29 +267,53 @@ Important:
     from litellm.exceptions import RateLimitError
     import time as _time
 
+    # Pick up reasoning_effort from env (set by orchestration script or CLI)
+    reasoning_effort = os.environ.get("REASONING_EFFORT")
+
     max_retries = 3
-    delay = 5
+    delay = 30
     last_exc = None
     for attempt in range(max_retries):
         try:
+            extra_args = {}
+            if reasoning_effort:
+                extra_args["reasoning_effort"] = reasoning_effort
             response = completion(
                 model=model_name,
                 messages=messages,
                 response_format={"type": "json_object"},
-                max_tokens=2048,
-                timeout=30,
+                max_tokens=8192,
+                timeout=120,
                 num_retries=0,
                 api_key=api_key,
                 api_base=api_base,
                 api_version=api_version,
+                **extra_args,
             )
-            content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            choice = (response.get("choices") or [{}])[0]
+            finish_reason = choice.get("finish_reason", "unknown")
+            content = choice.get("message", {}).get("content") or ""
+            print(f"[nodes_to_nl] attempt {attempt+1}/{max_retries} finish_reason={finish_reason} content_len={len(content)}", file=sys.stderr)
+            if finish_reason == "length":
+                print(f"[nodes_to_nl WARNING] finish_reason=length — max_tokens budget exhausted (likely by reasoning tokens), content is truncated/empty", file=sys.stderr)
             parsed = json.loads(content.strip())
 
             response_text = parsed.get("final_answer", "").strip()
             node_contributions = parsed.get("node_contributions", {})
 
             return (response_text, node_contributions)
+        except json.JSONDecodeError as e:
+            last_exc = e
+            # Log what the response actually contained so we can diagnose why content was empty/invalid
+            try:
+                raw_choices = response.get("choices") or []
+                raw_content = raw_choices[0].get("message", {}).get("content") if raw_choices else None
+                raw_finish = raw_choices[0].get("finish_reason") if raw_choices else None
+                print(f"[nodes_to_nl ERROR] JSONDecodeError: finish_reason={raw_finish} raw_content={repr(str(raw_content)[:300])}", file=sys.stderr)
+            except Exception:
+                print(f"[nodes_to_nl ERROR] JSONDecodeError: could not inspect response", file=sys.stderr)
+            if attempt < max_retries - 1:
+                print(f"[nodes_to_nl ERROR] {type(e).__name__} (attempt {attempt+1}/{max_retries}), retrying in {delay}s...", file=sys.stderr)
         except (RateLimitError, _litellm.Timeout) as e:
             last_exc = e
             if attempt < max_retries - 1:
@@ -323,6 +347,7 @@ def main():
     parser.add_argument("--ark-model", type=str, default="azure/gpt-5.4", help="ARK backbone. Pass when you run (e.g. azure/gpt-5.4).")
     parser.add_argument("--ark-agents", type=int, default=3, help="ARK parallel agents (paper A.2: n=3).")
     parser.add_argument("--ark-max-steps", type=int, default=20, help="ARK max steps per trajectory (paper A.2: Tmax=20).")
+    parser.add_argument("--reasoning-effort", type=str, default=None, choices=["none", "low", "medium", "high", "xhigh"], help="reasoning_effort for gpt-5.x models. Applied to ALL models in pipeline (ARK agents, nodes_to_nl). Falls back to REASONING_EFFORT env var.")
     parser.add_argument(
         "--ark-input",
         type=str,
@@ -404,6 +429,10 @@ def main():
             embeddings_path = graph_dir / "embeddings_kalm.npy"
             if embeddings_path.exists():
                 cmd.extend(["--embeddings-path", str(embeddings_path)])
+        # Pass reasoning_effort to ARK subprocess (CLI arg takes priority, then env var)
+        resolved_effort = args.reasoning_effort or os.environ.get("REASONING_EFFORT")
+        if resolved_effort:
+            cmd.extend(["--reasoning-effort", resolved_effort])
         _RATE_LIMIT_PATTERNS = ("RateLimitReached", "RateLimitError", "429")
         _ark_delay = 30
         result = None
