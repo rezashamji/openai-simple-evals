@@ -30,7 +30,7 @@ NC='\033[0m'
 LLM_MODEL="azure/gpt-5.4"          # Change this
 KG_NAME="optimus"                  # Change this (optimus, prime, etc.)
 SEARCH_MODE="embedding"            # Change this (hybrid, embedding, bm25)
-LIMIT=3                            # Change this
+LIMIT=5000                            # Change this
 REASONING_EFFORT="medium"          # Change this (none, low, medium, high, xhigh)
 
 ################################################################################
@@ -142,8 +142,8 @@ else
         --graph-name "$KG_NAME" \
         --search-mode "$SEARCH_MODE" \
         --ark-model "$LLM_MODEL" \
-        --ark-agents 3 \
-        --ark-max-steps 20 \
+        --ark-agents 2 \
+        --ark-max-steps 10 \
         --n-workers 2 \
         --limit "$LIMIT" \
         --run-tag "kg_grounded" \
@@ -210,7 +210,7 @@ echo -e "${BLUE}PHASE 2A: GRADE KG-GROUNDED RESPONSES${NC}"
 echo ""
 
 PHASE2A_CHECKPOINT="${OUTPUT_DIR}/phase1a_kg_responses_grading_checkpoint.jsonl"
-PHASE2A_EXISTING=$(wc -l "$PHASE2A_CHECKPOINT" 2>/dev/null | awk '{print $1}' || echo 0)
+PHASE2A_EXISTING=$(wc -l "$PHASE2A_CHECKPOINT" 2>/dev/null | awk '{print $1}'); PHASE2A_EXISTING=${PHASE2A_EXISTING:-0}
 
 if [ "$PHASE2A_EXISTING" -ge "$LIMIT" ]; then
     echo -e "${GREEN}✓ Phase 2A already complete: ${PHASE2A_EXISTING} lines (skipping)${NC}"
@@ -248,7 +248,7 @@ echo -e "${BLUE}PHASE 2B: GRADE BASELINE RESPONSES${NC}"
 echo ""
 
 PHASE2B_CHECKPOINT="${OUTPUT_DIR}/phase1b_baseline_responses_grading_checkpoint.jsonl"
-PHASE2B_EXISTING=$(wc -l "$PHASE2B_CHECKPOINT" 2>/dev/null | awk '{print $1}' || echo 0)
+PHASE2B_EXISTING=$(wc -l "$PHASE2B_CHECKPOINT" 2>/dev/null | awk '{print $1}'); PHASE2B_EXISTING=${PHASE2B_EXISTING:-0}
 
 if [ "$PHASE2B_EXISTING" -ge "$LIMIT" ]; then
     echo -e "${GREEN}✓ Phase 2B already complete: ${PHASE2B_EXISTING} lines (skipping)${NC}"
