@@ -119,13 +119,23 @@ def extract_part4_metadata(grading_output: Dict[str, Any]) -> tuple[Optional[str
             'contradiction_ratio': item.get('contradiction_ratio'),
             'mixed_signals': item.get('mixed_signals'),
 
-            # Part 4.2: KG influence label
+            # New step_4_1 sub-type counts
+            'num_neutral_not_contributed': item.get('num_neutral_not_contributed'),
+            'num_neutral_in_response_not_cited': item.get('num_neutral_in_response_not_cited'),
+            'num_neutral_in_response_direction_unclear': item.get('num_neutral_in_response_direction_unclear'),
+            'num_push_met_but_criterion_not_met': item.get('num_push_met_but_criterion_not_met'),
+            'num_push_not_met_but_criterion_met': item.get('num_push_not_met_but_criterion_met'),
+            'num_primary_helped': item.get('num_primary_helped'),
+            'num_supporting_helped': item.get('num_supporting_helped'),
+            'num_incidental_helped': item.get('num_incidental_helped'),
+            'num_primary_hurt': item.get('num_primary_hurt'),
+            'num_supporting_hurt': item.get('num_supporting_hurt'),
+            'num_incidental_hurt': item.get('num_incidental_hurt'),
+
+            # Part 4.2: KG influence label + summary label
+            'kg_label': item.get('kg_label'),
             'kg_influence_label': item.get('kg_influence_label'),
             'assignment_reason': item.get('assignment_reason'),
-
-            # Part 4.3: Confidence
-            'confidence_level': item.get('confidence_level'),
-            'confidence_reasoning': item.get('confidence_reasoning'),
 
             # Part 4.5: High contradiction analysis (conditional)
             'high_contradiction_label_consistency': item.get('high_contradiction_label_consistency'),
