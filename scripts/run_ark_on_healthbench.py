@@ -468,7 +468,7 @@ def main():
                 filtered = [l for l in result.stderr.split('\n')
                             if l.strip() and not any(p in l for p in _NOISE)]
                 if filtered:
-                    print(f"[ARK_STDERR]\n" + "\n".join(filtered[:20]), file=sys.stderr)
+                    print(f"[ARK_STDERR]\n" + "\n".join(filtered[-20:]), file=sys.stderr)
             pass  # Defaults remain empty
         else:
             # Log unexpected stderr from subprocess, filtering known benign noise
@@ -518,14 +518,24 @@ def main():
     new_results: dict[int, dict] = {}
     n_workers = max(1, int(args.n_workers))
     log_interval = max(0, args.log_interval)  # 0 disables logging
+    import threading
+    _cp_lock = threading.Lock()
+
+    def _append_result(out: dict) -> None:
+        """Append one result to checkpoint immediately so progress survives crashes."""
+        with _cp_lock:
+            with open(output_path, "a", encoding="utf-8") as cp_f:
+                cp_f.write(json.dumps(out, ensure_ascii=False) + "\n")
+
     if to_compute:
         if n_workers == 1:
             for k, i in enumerate(to_compute):
                 _, out = process_one(i, examples[i])
                 new_results[i] = out
+                _append_result(out)
                 if (k + 1) % 10 == 0 or (k + 1) == len(to_compute):
                     print(f"  {k + 1}/{len(to_compute)} computed.", file=sys.stderr)
-                # Log progress if logging enabled and checkpoint written
+                # Log progress if logging enabled
                 if log_interval > 0 and (k + 1) % log_interval == 0:
                     try:
                         log_phase1_progress(str(output_path), k + 1, log_interval)
@@ -538,10 +548,11 @@ def main():
                 for future in as_completed(futures):
                     i, out = future.result()
                     new_results[i] = out
+                    _append_result(out)
                     done += 1
                     if done % 10 == 0 or done == len(to_compute):
                         print(f"  {done}/{len(to_compute)} computed.", file=sys.stderr)
-                    # Log progress if logging enabled and checkpoint written
+                    # Log progress if logging enabled
                     if log_interval > 0 and done % log_interval == 0:
                         try:
                             log_phase1_progress(str(output_path), done, log_interval)
@@ -551,9 +562,8 @@ def main():
             if i not in new_results:
                 raise RuntimeError(f"Missing result for example index {i}")
 
-    # Build full results in eval order (cache + newly computed) so Phase 2 index alignment holds.
+    # Rewrite in correct eval order (cache + newly computed) so Phase 2 index alignment holds.
     results = build_results_in_order(examples, id_to_result, new_results)
-
     with open(output_path, "w", encoding="utf-8") as out_f:
         for out in results:
             out_f.write(json.dumps(out, ensure_ascii=False) + "\n")
