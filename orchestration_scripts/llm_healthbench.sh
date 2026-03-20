@@ -28,6 +28,7 @@ else
     # Editable config mode (for direct sbatch submission)
     LLM_MODEL="azure/gpt-5.4"                                           # Change this
     LIMIT=5000                                                          # Change this
+    REASONING_EFFORT="medium"                                           # Change this (none, low, medium, high, xhigh)
     INPUT_JSONL="/n/holylfs06/LABS/mzitnik_lab/Users/rshamji/rshamji/simple-evals/2025-05-07-06-14-12_oss_eval.jsonl"
     BASE_OUTPUT_DIR="/n/holylfs06/LABS/mzitnik_lab/Users/rshamji/rshamji/simple-evals/results/arkplus_evals"
 
@@ -39,6 +40,9 @@ fi
 # Defaults
 VENV_PYTHON="${VENV_PYTHON:-python}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Export REASONING_EFFORT so all Python subprocesses (baseline model, grader, judge) pick it up
+export REASONING_EFFORT="${REASONING_EFFORT:-medium}"
 
 ################################################################################
 # VALIDATION
