@@ -75,18 +75,25 @@ def call_gpt_baseline(
     api_base = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get("AZURE_OPENAI_API_BASE") or os.environ.get("AZURE_API_BASE")
     api_version = os.environ.get("AZURE_OPENAI_API_VERSION") or os.environ.get("AZURE_API_VERSION")
 
+    # Pick up reasoning_effort from env (set by orchestration script)
+    reasoning_effort = os.environ.get("REASONING_EFFORT")
+
     # Retry logic: retry on failure
     for attempt in range(max_retries):
         try:
+            extra_args = {}
+            if reasoning_effort:
+                extra_args["reasoning_effort"] = reasoning_effort
             response = completion(
                 model=model_name,
                 messages=messages,
                 max_tokens=2048,
-                timeout=30,
+                timeout=120,
                 num_retries=0,
                 api_key=api_key,
                 api_base=api_base,
                 api_version=api_version,
+                **extra_args,
             )
             content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
             response_text = content.strip()
