@@ -22,7 +22,7 @@ set -e
 LLM_MODEL="azure/gpt-5.4"          # Change to any model (e.g., "azure/gpt-4.1", "azure/gpt-5.4")
 KG_NAME="optimus"                  # Change to any KG (e.g., "optimus", "prime")
 SEARCH_MODE="embedding"            # Fixed for this batch file
-LIMIT=10
+LIMIT=5
 
 
 ################################################################################
