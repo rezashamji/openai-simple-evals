@@ -12,6 +12,7 @@ All LLM calls use strict JSON output with validation.
 
 import json
 import logging
+import os
 import time
 from typing import Optional
 
@@ -89,6 +90,45 @@ Rules:
 Return ONLY valid JSON, no markdown code blocks or extra text.
 """.strip()
 
+PHASE_D2_CAUSAL_WEIGHT_TEMPLATE = """
+You are analyzing which knowledge graph (KG) nodes were the primary drivers of a grading outcome for a medical criterion.
+
+# Criterion
+<<criterion_statement>>
+
+# Criterion Outcome
+Met: <<criteria_met>>
+Points: <<points>>
+Grader explanation: <<grading_explanation>>
+
+# Cited KG Nodes
+<<cited_nodes_list>>
+
+For each node the following is provided:
+- Node ID
+- Node summary (the KG content)
+- Part 2 contribution explanation (how the node appeared in the response)
+- Justification reasoning (why the grader cited this node)
+- Direction relative to criterion (PUSHED_TOWARD_MET / PUSHED_TOWARD_NOT_MET)
+- Direction reasoning
+- Final node label (HELPED / HURT / CONTRADICTION / etc.)
+
+# Task
+For each cited node, assign a causal weight based on how much it drove whether the criterion was met or not:
+- PRIMARY: This node was the main driver of the criterion outcome. Without it, the outcome would likely have been different.
+- SUPPORTING: This node contributed meaningfully but was not decisive on its own.
+- INCIDENTAL: This node was cited in the explanation but had minimal causal impact on the outcome.
+
+Return a JSON object:
+{
+  "node_causal_weights": [
+    {"node_index": "<id>", "causal_weight": "PRIMARY|SUPPORTING|INCIDENTAL", "reasoning": "<one sentence>"}
+  ]
+}
+
+Return ONLY valid JSON, no markdown.
+""".strip()
+
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
@@ -145,11 +185,20 @@ def call_llm_with_validation(
     for key, value in replacements.items():
         prompt = prompt.replace(f"<<{key}>>", str(value))
 
+    # Pick up reasoning_effort from env (set by orchestration script)
+    reasoning_effort = os.environ.get("REASONING_EFFORT")
+
+    logger.warning(f"[call_llm_with_validation] model={model}, reasoning_effort={reasoning_effort}, prompt_len={len(prompt)}, expected_keys={expected_keys}")
+    logger.warning(f"[call_llm_with_validation] prompt preview: {prompt[:300]!r}")
+
     # Call LLM with response_format to guarantee valid JSON
     max_retries = 5
     delay = 15
     for attempt in range(max_retries):
         try:
+            extra_args = {}
+            if reasoning_effort:
+                extra_args["reasoning_effort"] = reasoning_effort
             response = litellm.completion(
                 model=model,
                 messages=[
@@ -160,18 +209,22 @@ def call_llm_with_validation(
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.7,
-                max_tokens=500,
+                max_tokens=2000,
                 num_retries=0,
+                **extra_args,
             )
             break
         except RateLimitError:
+            logger.warning(f"[call_llm_with_validation] RateLimitError on attempt {attempt+1}/{max_retries}, sleeping {delay}s")
             if attempt == max_retries - 1:
                 raise
             time.sleep(delay)
             delay *= 2
 
     response_text = response.choices[0].message.content
-    logger.debug(f"LLM response: {response_text}")
+    finish_reason = response.choices[0].finish_reason
+    usage = getattr(response, "usage", None)
+    logger.warning(f"[call_llm_with_validation] finish_reason={finish_reason}, usage={usage}, response_text type={type(response_text)}, response_text={response_text!r}")
 
     # Validate required keys (JSON format guaranteed by response_format)
     return validate_json_response(response_text, expected_keys)
@@ -850,6 +903,71 @@ def process_node_criterion_pair_part3(
     }
 
 
+def step_3_1_4b_comparative_causal_weight(
+    cited_nodes: list[dict],
+    criterion_statement: str,
+    criteria_met: bool,
+    points: int,
+    grading_explanation: str,
+    model: str = "azure/gpt-5.4",
+) -> dict:
+    """
+    Part 3.1.4b: Comparative causal weight LLM call.
+
+    Takes all cited nodes for a criterion together, and assigns each a
+    causal weight: PRIMARY, SUPPORTING, or INCIDENTAL.
+
+    Only called for nodes where node_used_as_justification_in_grading_explanation=True.
+    Uncited nodes are skipped — no causal_weight is assigned to them.
+
+    Args:
+        cited_nodes: List of node dicts (each has node_index, node_summary,
+            final_node_contribution_explanation, node_used_as_justification_in_grading_explanation_reasoning,
+            node_direction_relative_to_criteria, node_direction_relative_to_criteria_reasoning, final_node_label)
+        criterion_statement: The rubric criterion text
+        criteria_met: Whether criterion was met
+        points: Points value for this criterion
+        grading_explanation: The grader's explanation text
+        model: LLM model to use
+
+    Returns:
+        Dict with "node_causal_weights": list of {node_index, causal_weight, reasoning}
+    """
+    if not cited_nodes:
+        return {"node_causal_weights": []}
+
+    logger.info(f"Part 3.1.4b: Assigning causal weights to {len(cited_nodes)} cited nodes")
+
+    # Format cited nodes list
+    cited_nodes_lines = []
+    for node in cited_nodes:
+        cited_nodes_lines.append(
+            f"Node ID: {node.get('node_index', node.get('node_id', ''))}\n"
+            f"Node summary: {node.get('node_summary', '')}\n"
+            f"Part 2 contribution explanation: {node.get('final_node_contribution_explanation', '')}\n"
+            f"Justification reasoning: {node.get('node_used_as_justification_in_grading_explanation_reasoning', '')}\n"
+            f"Direction: {node.get('node_direction_relative_to_criteria', '')}\n"
+            f"Direction reasoning: {node.get('node_direction_relative_to_criteria_reasoning', '')}\n"
+            f"Final label: {node.get('final_node_label', '')}"
+        )
+    cited_nodes_str = "\n\n".join(cited_nodes_lines)
+
+    result = call_llm_with_validation(
+        template=PHASE_D2_CAUSAL_WEIGHT_TEMPLATE,
+        replacements={
+            "criterion_statement": criterion_statement,
+            "criteria_met": "true" if criteria_met else "false",
+            "points": str(points),
+            "grading_explanation": grading_explanation,
+            "cited_nodes_list": cited_nodes_str,
+        },
+        expected_keys=["node_causal_weights"],
+        model=model,
+    )
+
+    return {"node_causal_weights": result.get("node_causal_weights", [])}
+
+
 # ============================================================================
 # PART 4.1: COUNT LABELS BY TYPE
 # ============================================================================
@@ -863,7 +981,10 @@ def step_4_1_count_labels(node_criterion_labels: list[dict]) -> dict:
         node_criterion_labels: List of Part 3 outputs (node+criterion pair labels)
 
     Returns:
-        Dict with counts of each label type
+        Dict with counts of each label type, including:
+        - 3-way neutral sub-types (not_contributed, in_response_not_cited, direction_unclear)
+        - 2 push direction sub-types (push_met_but_criterion_not_met, push_not_met_but_criterion_met)
+        - 6 causal weight counters (primary/supporting/incidental for helped and hurt)
     """
     logger.info(f"Part 4.1: Counting labels across {len(node_criterion_labels)} nodes")
 
@@ -873,8 +994,26 @@ def step_4_1_count_labels(node_criterion_labels: list[dict]) -> dict:
     num_contradiction_nodes = 0
     num_unclear_direction_nodes = 0
 
+    # 3-way neutral sub-types
+    num_neutral_not_contributed = 0       # step 3.1.1: final_contributed=False — node never appeared in response
+    num_neutral_in_response_not_cited = 0 # step 3.1.3: in response but grader didn't cite it
+    num_neutral_in_response_direction_unclear = 0  # step 3.1.5: cited but UNCLEAR_DIRECTION
+
+    # Push direction sub-types
+    num_push_met_but_criterion_not_met = 0   # pushed toward met, criterion failed
+    num_push_not_met_but_criterion_met = 0   # pushed toward not-met, criterion passed
+
+    # Causal weight counters (only for nodes that have causal_weight set)
+    num_primary_helped = 0
+    num_supporting_helped = 0
+    num_incidental_helped = 0
+    num_primary_hurt = 0
+    num_supporting_hurt = 0
+    num_incidental_hurt = 0
+
     for label_result in node_criterion_labels:
         final_label = label_result.get("final_node_label")
+        causal_weight = label_result.get("causal_weight")  # only set on cited nodes
 
         # HELPED labels
         if final_label in [
@@ -882,6 +1021,12 @@ def step_4_1_count_labels(node_criterion_labels: list[dict]) -> dict:
             LABEL_HELPED_NEGATIVE_POINTS
         ]:
             num_helped_nodes += 1
+            if causal_weight == "PRIMARY":
+                num_primary_helped += 1
+            elif causal_weight == "SUPPORTING":
+                num_supporting_helped += 1
+            elif causal_weight == "INCIDENTAL":
+                num_incidental_helped += 1
 
         # HURT labels
         elif final_label in [
@@ -889,20 +1034,34 @@ def step_4_1_count_labels(node_criterion_labels: list[dict]) -> dict:
             LABEL_HURT_NEGATIVE_POINTS
         ]:
             num_hurt_nodes += 1
+            if causal_weight == "PRIMARY":
+                num_primary_hurt += 1
+            elif causal_weight == "SUPPORTING":
+                num_supporting_hurt += 1
+            elif causal_weight == "INCIDENTAL":
+                num_incidental_hurt += 1
 
-        # NEUTRAL labels
-        elif final_label in [
-            LABEL_NEUTRAL_NOT_IN_RESPONSE,
-            LABEL_NEUTRAL_IN_RESPONSE
-        ]:
+        # NEUTRAL labels — track 3-way sub-types
+        elif final_label == LABEL_NEUTRAL_NOT_IN_RESPONSE:
             num_neutral_nodes += 1
+            num_neutral_not_contributed += 1
+        elif final_label == LABEL_NEUTRAL_IN_RESPONSE:
+            num_neutral_nodes += 1
+            # Distinguish: was it cited by grader (direction_unclear) or not cited at all?
+            if label_result.get("node_direction_relative_to_criteria") == "UNCLEAR_DIRECTION":
+                num_neutral_in_response_direction_unclear += 1
+            else:
+                num_neutral_in_response_not_cited += 1
 
-        # Diagnostic (contradiction) labels
-        elif final_label in [
-            LABEL_CONTRADICTION_NOT_MET,
-            LABEL_CONTRADICTION_MET
-        ]:
+        # Diagnostic (contradiction/push) labels — track direction sub-types
+        elif final_label == LABEL_CONTRADICTION_NOT_MET:
+            # pushed toward met but criterion not met (criteria_met=False)
             num_contradiction_nodes += 1
+            num_push_met_but_criterion_not_met += 1
+        elif final_label == LABEL_CONTRADICTION_MET:
+            # pushed toward not-met but criterion passed (criteria_met=True)
+            num_contradiction_nodes += 1
+            num_push_not_met_but_criterion_met += 1
 
         # Track unclear direction (diagnostic)
         if label_result.get("node_direction_relative_to_criteria") == "UNCLEAR_DIRECTION":
@@ -926,6 +1085,21 @@ def step_4_1_count_labels(node_criterion_labels: list[dict]) -> dict:
         "num_neutral_nodes": num_neutral_nodes,
         "num_contradiction_nodes": num_contradiction_nodes,
         "num_unclear_direction_nodes": num_unclear_direction_nodes,
+        # 3-way neutral sub-types
+        "num_neutral_not_contributed": num_neutral_not_contributed,
+        "num_neutral_in_response_not_cited": num_neutral_in_response_not_cited,
+        "num_neutral_in_response_direction_unclear": num_neutral_in_response_direction_unclear,
+        # Push direction sub-types
+        "num_push_met_but_criterion_not_met": num_push_met_but_criterion_not_met,
+        "num_push_not_met_but_criterion_met": num_push_not_met_but_criterion_met,
+        # Causal weight counters
+        "num_primary_helped": num_primary_helped,
+        "num_supporting_helped": num_supporting_helped,
+        "num_incidental_helped": num_incidental_helped,
+        "num_primary_hurt": num_primary_hurt,
+        "num_supporting_hurt": num_supporting_hurt,
+        "num_incidental_hurt": num_incidental_hurt,
+        # Derived metrics
         "total_nodes": total_nodes,
         "contradiction_ratio": contradiction_ratio,
         "mixed_signals": mixed_signals,
@@ -936,50 +1110,50 @@ def step_4_1_count_labels(node_criterion_labels: list[dict]) -> dict:
 # PART 4.2: ASSIGN KG INFLUENCE LABEL
 # ============================================================================
 
-# 7 possible KG influence labels
-KG_INFLUENCE_HELPED = "KG_HELPED"
-KG_INFLUENCE_HURT = "KG_HURT"
-KG_INFLUENCE_NEUTRAL = "KG_NEUTRAL"
-KG_INFLUENCE_HELPED_DESPITE_CONFLICTS = "KG_HELPED_DESPITE_CONFLICTS"
-KG_INFLUENCE_HURT_DESPITE_CONFLICTS = "KG_HURT_DESPITE_CONFLICTS"
-KG_INFLUENCE_UNCLEAR_MIXED_SIGNALS = "KG_UNCLEAR_MIXED_SIGNALS"
-KG_INFLUENCE_OVERRIDDEN_BY_NON_KG = "KG_OVERRIDDEN_BY_NON_KG"
-KG_INFLUENCE_UNEXPLAINED_CONTRADICTIONS = "KG_UNEXPLAINED_CONTRADICTIONS"
-
-
 def step_4_2_assign_kg_influence_label(
+    # Node counts from step_4_1
     num_helped_nodes: int,
     num_hurt_nodes: int,
     num_neutral_nodes: int,
+    # 3-way neutral sub-type counts
+    num_neutral_not_contributed: int,
+    num_neutral_in_response_not_cited: int,
+    num_neutral_in_response_direction_unclear: int,
     num_contradiction_nodes: int,
+    num_push_met_but_criterion_not_met: int,
+    num_push_not_met_but_criterion_met: int,
+    total_nodes: int,
+    max_nodes_allowed: int,
     contradiction_ratio: float,
     mixed_signals: bool,
+    # Causal weight counts
+    num_primary_helped: int = 0,
+    num_supporting_helped: int = 0,
+    num_incidental_helped: int = 0,
+    num_primary_hurt: int = 0,
+    num_supporting_hurt: int = 0,
+    num_incidental_hurt: int = 0,
+    # Step 4.5 outputs (only if contradiction_ratio >= 0.25)
+    high_contradiction_label_consistency: Optional[str] = None,
+    # Step 4.7 outputs (only if mixed_signals=True)
     conflicting_signals_label_consistency: Optional[str] = None,
     conflicting_signals_dominant_influence: Optional[str] = None,
-    high_contradiction_label_consistency: Optional[str] = None,
+    # Criterion outcome (needed for push direction tokens in Easy Case / Case A)
+    criteria_met: Optional[bool] = None,
 ) -> dict:
     """
-    Part 4.2: Assign KG influence label based on node counts and consistency checks.
+    Part 4.2: Assign verbose KG influence label using 6-case structure.
 
-    Logic (in order):
-    1. Simple cases: Only helped OR only hurt OR no impact
-    2. Conflicting signals case: Both helped AND hurt nodes exist → use Step 4.7 consistency check
-    3. High contradiction case: contradiction_ratio >= 0.25 → use Step 4.5 consistency check
-
-    Args:
-        num_helped_nodes: Count of HELPED-labeled nodes
-        num_hurt_nodes: Count of HURT-labeled nodes
-        num_neutral_nodes: Count of NEUTRAL-labeled nodes
-        num_contradiction_nodes: Count of diagnostic contradiction labels
-        contradiction_ratio: Ratio of contradiction nodes to total nodes
-        mixed_signals: Whether both helped AND hurt nodes exist
-        conflicting_signals_label_consistency: Output from Step 4.7 (CONSISTENT/INCONSISTENT/UNCLEAR)
-        high_contradiction_label_consistency: Output from Step 4.5 (CONSISTENT/INCONSISTENT/UNCLEAR)
+    Cases determined by mixed_signals x contradiction_ratio:
+    - Easy Case: not mixed_signals and contradiction_ratio == 0
+    - Case A: not mixed_signals and 0 < contradiction_ratio < 0.25
+    - Case E: mixed_signals and contradiction_ratio == 0
+    - Case B: mixed_signals and 0 < contradiction_ratio < 0.25
+    - Case C: not mixed_signals and contradiction_ratio >= 0.25
+    - Case D: mixed_signals and contradiction_ratio >= 0.25
 
     Returns:
-        Dict with:
-        - kg_influence_label: One of 8 possible labels
-        - assignment_reason: Brief explanation of why this label was assigned
+        Dict with kg_influence_label (verbose string) and assignment_reason
     """
     logger.info(
         f"Part 4.2: Assigning KG influence label "
@@ -987,166 +1161,433 @@ def step_4_2_assign_kg_influence_label(
         f"contradiction_ratio={contradiction_ratio:.3f}, mixed_signals={mixed_signals})"
     )
 
-    # ========================================================================
-    # HIGH CONTRADICTION CASE (contradiction_ratio >= 0.25) - CHECK FIRST
-    # Trigger Step 4.5 analysis first
-    # ========================================================================
-
-    if contradiction_ratio >= 0.25:
-        # Step 4.5 should have already run; use its consistency result
-        if high_contradiction_label_consistency is None:
-            logger.warning(
-                "contradiction_ratio >= 0.25 but high_contradiction_label_consistency is None. "
-                "Step 4.5 should have been called first. Defaulting to UNCLEAR."
-            )
-            high_contradiction_label_consistency = "UNCLEAR"
-
-        if high_contradiction_label_consistency == "CONSISTENT":
-            return {
-                "kg_influence_label": KG_INFLUENCE_OVERRIDDEN_BY_NON_KG,
-                "assignment_reason": (
-                    f"High contradiction ratio ({contradiction_ratio:.1%}). "
-                    "Diagnostic labels dominated, but non-KG reasoning resolved outcome (Step 4.5 consistent)."
-                ),
-            }
+    # ------------------------------------------------------------------
+    # Helper: KG coverage token
+    # ------------------------------------------------------------------
+    def _coverage_token():
+        if max_nodes_allowed <= 0:
+            return "MEDIUM_KG_COVERAGE"
+        ratio = total_nodes / max_nodes_allowed
+        if ratio <= 0.15:
+            return "LOW_KG_COVERAGE"
+        elif ratio <= 0.45:
+            return "MEDIUM_KG_COVERAGE"
         else:
-            # INCONSISTENT or UNCLEAR
-            return {
-                "kg_influence_label": KG_INFLUENCE_UNEXPLAINED_CONTRADICTIONS,
-                "assignment_reason": (
-                    f"High contradiction ratio ({contradiction_ratio:.1%}). "
-                    f"Too many contradictions to explain (Step 4.5 consistency: {high_contradiction_label_consistency})."
-                ),
-            }
+            return "HIGH_KG_COVERAGE"
 
-    # ========================================================================
-    # CONFLICTING SIGNALS CASE (both helped AND hurt nodes exist)
-    # Trigger Step 4.7 analysis first
-    # ========================================================================
+    # ------------------------------------------------------------------
+    # Helper: Causal weight token for dominant side (helped or hurt)
+    # ------------------------------------------------------------------
+    def _causal_weight_token(side: str) -> Optional[str]:
+        """side is 'helped' or 'hurt'"""
+        if side == "helped":
+            primary, supporting, incidental = num_primary_helped, num_supporting_helped, num_incidental_helped
+            all_token = "ALL_HELPED_NODES_WERE_MAIN_DRIVER"
+            mostly_main = "HELPED_NODES_MOSTLY_MAIN_DRIVER"
+            mostly_support = "HELPED_NODES_MOSTLY_MEANINGFUL_NOT_DECISIVE"
+            mostly_incidental = "HELPED_NODES_MOSTLY_MINOR_CAUSAL_IMPACT"
+        else:
+            primary, supporting, incidental = num_primary_hurt, num_supporting_hurt, num_incidental_hurt
+            all_token = "ALL_HURT_NODES_WERE_MAIN_DRIVER"
+            mostly_main = "HURT_NODES_MOSTLY_MAIN_DRIVER"
+            mostly_support = "HURT_NODES_MOSTLY_MEANINGFUL_NOT_DECISIVE"
+            mostly_incidental = "HURT_NODES_MOSTLY_MINOR_CAUSAL_IMPACT"
 
-    if mixed_signals and contradiction_ratio < 0.25:
-        # Step 4.7 should have already run; use its consistency result
-        if conflicting_signals_label_consistency is None:
-            logger.warning(
-                "mixed_signals=True but conflicting_signals_label_consistency is None. "
-                "Step 4.7 should have been called first. Defaulting to UNCLEAR."
-            )
-            conflicting_signals_label_consistency = "UNCLEAR"
-
-            # LLM explained which signal won out
-            if num_helped_nodes > num_hurt_nodes:
-                return {
-                    "kg_influence_label": KG_INFLUENCE_HELPED_DESPITE_CONFLICTS,
-                    "assignment_reason": (
-                        f"Conflicting signals ({num_helped_nodes} helped vs {num_hurt_nodes} hurt), "
-                        f"but helped nodes dominated (Step 4.7 consistent)"
-                    ),
-                }
+        total_w = primary + supporting + incidental
+        if total_w == 0:
+            return None  # no causal weights set (step_3_1_4b didn't run or no cited nodes)
+        if primary == total_w:
+            return all_token
+        # majority bucket (tie-break: higher weight wins)
+        if primary > total_w / 2:
+            return mostly_main
+        elif supporting > total_w / 2:
+            return mostly_support
+        elif incidental > total_w / 2:
+            return mostly_incidental
+        else:
+            # tie — use highest-weight bucket
+            if primary >= supporting and primary >= incidental:
+                return mostly_main
+            elif supporting >= incidental:
+                return mostly_support
             else:
-                return {
-                    "kg_influence_label": KG_INFLUENCE_HURT_DESPITE_CONFLICTS,
-                    "assignment_reason": (
-                        f"Conflicting signals ({num_helped_nodes} helped vs {num_hurt_nodes} hurt), "
-                        f"but hurt nodes dominated (Step 4.7 consistent)"
-                    ),
-                }
+                return mostly_incidental
+
+    # ------------------------------------------------------------------
+    # Helper: 3-way neutral suffix tokens
+    # ------------------------------------------------------------------
+    def _neutral_tokens() -> str:
+        nc = "ALL_NODES_APPEARED_IN_RESPONSE" if num_neutral_not_contributed == 0 else "SOME_NODES_NEVER_APPEARED_IN_RESPONSE"
+        cited = "ALL_RESPONSE_NODES_CITED_BY_GRADER" if num_neutral_in_response_not_cited == 0 else "SOME_NODES_IN_RESPONSE_BUT_GRADER_DID_NOT_CITE"
+        clear = "ALL_CITED_NODES_HAD_CLEAR_IMPACT" if num_neutral_in_response_direction_unclear == 0 else "SOME_NODES_GRADER_CITED_BUT_IMPACT_UNCLEAR"
+        return f"__{nc}__{cited}__{clear}"
+
+    # ------------------------------------------------------------------
+    # Helper: push contradiction token (for Case B suffix)
+    # ------------------------------------------------------------------
+    def _push_token_suffix() -> str:
+        if num_contradiction_nodes == 0:
+            return "__NO_PUSH_CONTRADICTIONS"
+        # Only one direction can be > 0 per criterion
+        if num_push_met_but_criterion_not_met > 0:
+            pct = num_push_met_but_criterion_not_met / total_nodes if total_nodes > 0 else 0
+            magnitude = "MAJOR" if pct >= 0.25 else "MINOR"
+            return f"__{magnitude}_PUSH_TOWARD_MET_BUT_CRITERION_FAILED"
         else:
-            # INCONSISTENT or UNCLEAR: can't determine which signal dominated
+            pct = num_push_not_met_but_criterion_met / total_nodes if total_nodes > 0 else 0
+            magnitude = "MAJOR" if pct >= 0.25 else "MINOR"
+            return f"__{magnitude}_PUSH_TOWARD_NOT_MET_BUT_CRITERION_PASSED"
+
+    # ------------------------------------------------------------------
+    # Helper: contradiction magnitude token (Cases C/D)
+    # ------------------------------------------------------------------
+    def _magnitude_token() -> str:
+        if contradiction_ratio < 0.50:
+            return "MODERATE"
+        elif contradiction_ratio < 0.75:
+            return "HIGH"
+        else:
+            return "EXTREME"
+
+    # ------------------------------------------------------------------
+    # Helper: push token embedded in base label (Cases A)
+    # ------------------------------------------------------------------
+    def _push_label_fragment() -> str:
+        """Returns the push fragment for Case A base labels."""
+        if num_push_met_but_criterion_not_met > 0:
+            pct = num_push_met_but_criterion_not_met / total_nodes if total_nodes > 0 else 0
+            magnitude = "MAJOR" if pct >= 0.25 else "MINOR"
+            return f"{magnitude}_PUSH_TOWARD_MET_BUT_CRITERION_FAILED"
+        else:
+            pct = num_push_not_met_but_criterion_met / total_nodes if total_nodes > 0 else 0
+            magnitude = "MAJOR" if pct >= 0.25 else "MINOR"
+            return f"{magnitude}_PUSH_TOWARD_NOT_MET_BUT_CRITERION_PASSED"
+
+    # ------------------------------------------------------------------
+    # Helper: assemble full label from base + suffixes
+    # ------------------------------------------------------------------
+    def _build_label(base: str, side: Optional[str] = None, include_push_suffix: bool = False, include_magnitude: bool = False, magnitude: Optional[str] = None) -> str:
+        label = base
+        if include_magnitude and magnitude:
+            label += f"_WITH_{magnitude}_CONTRADICTIONS"
+        label += f"__{_coverage_token()}"
+        if side:
+            cw = _causal_weight_token(side)
+            if cw:
+                label += f"__{cw}"
+        if include_push_suffix:
+            label += _push_token_suffix()
+        label += _neutral_tokens()
+        return label
+
+    coverage = _coverage_token()
+
+    # ------------------------------------------------------------------
+    # EASY CASE: not mixed_signals, contradiction_ratio == 0
+    # ------------------------------------------------------------------
+    if not mixed_signals and contradiction_ratio == 0:
+        if total_nodes == 0:
             return {
-                "kg_influence_label": KG_INFLUENCE_UNCLEAR_MIXED_SIGNALS,
-                "assignment_reason": (
-                    f"Conflicting signals ({num_helped_nodes} helped vs {num_hurt_nodes} hurt), "
-                    f"but Step 4.7 consistency check was {conflicting_signals_label_consistency}"
-                ),
+                "kg_influence_label": "KG_NO_NODES_RETRIEVED_NO_SIGNAL",
+                "assignment_reason": "No KG nodes retrieved",
+            }
+        if num_helped_nodes > 0 and num_hurt_nodes == 0:
+            base = "KG_NODES_HELPED_NO_CONFLICTS_NO_CONTRADICTIONS"
+            return {
+                "kg_influence_label": _build_label(base, side="helped"),
+                "assignment_reason": f"Easy case: helped={num_helped_nodes}, hurt=0, contradiction_ratio=0",
+            }
+        if num_hurt_nodes > 0 and num_helped_nodes == 0:
+            base = "KG_NODES_HURT_NO_CONFLICTS_NO_CONTRADICTIONS"
+            return {
+                "kg_influence_label": _build_label(base, side="hurt"),
+                "assignment_reason": f"Easy case: hurt={num_hurt_nodes}, helped=0, contradiction_ratio=0",
+            }
+        # helped=0, hurt=0 — neutral sub-cases
+        if num_neutral_not_contributed > 0 and (num_neutral_in_response_not_cited + num_neutral_in_response_direction_unclear) == 0:
+            base = "KG_NODES_ALL_ABSENT_FROM_RESPONSE_NO_EFFECT"
+        elif num_neutral_not_contributed == 0:
+            base = "KG_NODES_PRESENT_IN_RESPONSE_BUT_NO_DIRECTIONAL_EFFECT"
+        else:
+            base = "KG_NODES_PARTIALLY_PRESENT_IN_RESPONSE_NO_DIRECTIONAL_EFFECT"
+        return {
+            "kg_influence_label": _build_label(base),
+            "assignment_reason": f"Easy case: no directional nodes (neutral only)",
+        }
+
+    # ------------------------------------------------------------------
+    # CASE A: not mixed_signals, 0 < contradiction_ratio < 0.25
+    # ------------------------------------------------------------------
+    if not mixed_signals and 0 < contradiction_ratio < 0.25:
+        push_frag = _push_label_fragment()
+        if num_helped_nodes > 0 and num_hurt_nodes == 0:
+            base = f"KG_NODES_HELPED_{push_frag}_WITH_MINOR_CONTRADICTIONS"
+            return {
+                "kg_influence_label": _build_label(base, side="helped"),
+                "assignment_reason": f"Case A: helped={num_helped_nodes}, contradiction_ratio={contradiction_ratio:.3f}",
+            }
+        if num_hurt_nodes > 0 and num_helped_nodes == 0:
+            base = f"KG_NODES_HURT_{push_frag}_WITH_MINOR_CONTRADICTIONS"
+            return {
+                "kg_influence_label": _build_label(base, side="hurt"),
+                "assignment_reason": f"Case A: hurt={num_hurt_nodes}, contradiction_ratio={contradiction_ratio:.3f}",
+            }
+        # helped=0, hurt=0 — pure push nodes
+        base = f"KG_NODES_{push_frag}_NO_NET_HELPED_OR_HURT_WITH_MINOR_CONTRADICTIONS"
+        return {
+            "kg_influence_label": _build_label(base),
+            "assignment_reason": f"Case A: no helped/hurt, only push nodes, contradiction_ratio={contradiction_ratio:.3f}",
+        }
+
+    # ------------------------------------------------------------------
+    # CASE E: mixed_signals, contradiction_ratio == 0
+    # ------------------------------------------------------------------
+    if mixed_signals and contradiction_ratio == 0:
+        consistency = conflicting_signals_label_consistency or "UNCLEAR"
+        dominant = conflicting_signals_dominant_influence or "unclear"
+        if consistency == "INCONSISTENT":
+            base = "KG_NODES_HELPED_AND_HURT__OUTCOME_DRIVER_UNCLEAR__GRADER_EXPLANATION_INTERNALLY_INCONSISTENT__NO_CONTRADICTIONS"
+            return {
+                "kg_influence_label": _build_label(base),
+                "assignment_reason": f"Case E INCONSISTENT: mixed_signals, consistency={consistency}",
+            }
+        if consistency == "UNCLEAR":
+            base = "KG_NODES_HELPED_AND_HURT__OUTCOME_DRIVER_UNCLEAR__GRADER_COULD_NOT_DETERMINE_WHICH_NODES_DROVE_OUTCOME__NO_CONTRADICTIONS"
+            return {
+                "kg_influence_label": _build_label(base),
+                "assignment_reason": f"Case E UNCLEAR: mixed_signals, consistency={consistency}",
+            }
+        # CONSISTENT
+        if dominant == "helped_nodes":
+            count_token = "RAW_NODE_COUNTS_AGREE_WITH_LLM" if num_helped_nodes > num_hurt_nodes else "RAW_NODE_COUNTS_DISAGREE_WITH_LLM"
+            base = f"KG_NODES_HELPED_AND_HURT__HELPED_NODES_DROVE_OUTCOME__GRADER_CLEARLY_EXPLAINS_WHICH_NODES_DROVE_OUTCOME__{count_token}__NO_CONTRADICTIONS"
+            side = "helped"
+        elif dominant == "hurt_nodes":
+            count_token = "RAW_NODE_COUNTS_AGREE_WITH_LLM" if num_hurt_nodes > num_helped_nodes else "RAW_NODE_COUNTS_DISAGREE_WITH_LLM"
+            base = f"KG_NODES_HELPED_AND_HURT__HURT_NODES_DROVE_OUTCOME__GRADER_CLEARLY_EXPLAINS_WHICH_NODES_DROVE_OUTCOME__{count_token}__NO_CONTRADICTIONS"
+            side = "hurt"
+        elif dominant == "mixed_with_nonkg_factors":
+            if num_helped_nodes > num_hurt_nodes:
+                count_token = "HELPED_COUNT_HIGHER"
+            elif num_hurt_nodes > num_helped_nodes:
+                count_token = "HURT_COUNT_HIGHER"
+            else:
+                count_token = "COUNTS_EQUAL"
+            base = f"KG_NODES_HELPED_AND_HURT__NON_KG_FACTORS_DROVE_OUTCOME__GRADER_CLEARLY_EXPLAINS_WHICH_NODES_DROVE_OUTCOME__{count_token}__NO_CONTRADICTIONS"
+            side = None
+        else:  # unclear
+            if num_helped_nodes > num_hurt_nodes:
+                count_token = "HELPED_COUNT_HIGHER"
+            elif num_hurt_nodes > num_helped_nodes:
+                count_token = "HURT_COUNT_HIGHER"
+            else:
+                count_token = "COUNTS_EQUAL"
+            base = f"KG_NODES_HELPED_AND_HURT__OUTCOME_DRIVER_UNCLEAR__GRADER_CLEARLY_EXPLAINS_WHICH_NODES_DROVE_OUTCOME__{count_token}__NO_CONTRADICTIONS"
+            side = None
+        return {
+            "kg_influence_label": _build_label(base, side=side),
+            "assignment_reason": f"Case E CONSISTENT: dominant={dominant}, helped={num_helped_nodes}, hurt={num_hurt_nodes}",
+        }
+
+    # ------------------------------------------------------------------
+    # CASE B: mixed_signals, 0 < contradiction_ratio < 0.25
+    # ------------------------------------------------------------------
+    if mixed_signals and 0 < contradiction_ratio < 0.25:
+        consistency = conflicting_signals_label_consistency or "UNCLEAR"
+        dominant = conflicting_signals_dominant_influence or "unclear"
+        if consistency == "INCONSISTENT":
+            base = "KG_NODES_HELPED_AND_HURT__OUTCOME_DRIVER_UNCLEAR__GRADER_EXPLANATION_INTERNALLY_INCONSISTENT__WITH_MINOR_CONTRADICTIONS"
+            return {
+                "kg_influence_label": _build_label(base, include_push_suffix=True),
+                "assignment_reason": f"Case B INCONSISTENT: mixed_signals, consistency={consistency}",
+            }
+        if consistency == "UNCLEAR":
+            base = "KG_NODES_HELPED_AND_HURT__OUTCOME_DRIVER_UNCLEAR__GRADER_COULD_NOT_DETERMINE_WHICH_NODES_DROVE_OUTCOME__WITH_MINOR_CONTRADICTIONS"
+            return {
+                "kg_influence_label": _build_label(base, include_push_suffix=True),
+                "assignment_reason": f"Case B UNCLEAR: mixed_signals, consistency={consistency}",
+            }
+        # CONSISTENT
+        if dominant == "helped_nodes":
+            count_token = "RAW_NODE_COUNTS_AGREE_WITH_LLM" if num_helped_nodes > num_hurt_nodes else "RAW_NODE_COUNTS_DISAGREE_WITH_LLM"
+            base = f"KG_NODES_HELPED_AND_HURT__HELPED_NODES_DROVE_OUTCOME__GRADER_CLEARLY_EXPLAINS_WHICH_NODES_DROVE_OUTCOME__{count_token}__WITH_MINOR_CONTRADICTIONS"
+            side = "helped"
+        elif dominant == "hurt_nodes":
+            count_token = "RAW_NODE_COUNTS_AGREE_WITH_LLM" if num_hurt_nodes > num_helped_nodes else "RAW_NODE_COUNTS_DISAGREE_WITH_LLM"
+            base = f"KG_NODES_HELPED_AND_HURT__HURT_NODES_DROVE_OUTCOME__GRADER_CLEARLY_EXPLAINS_WHICH_NODES_DROVE_OUTCOME__{count_token}__WITH_MINOR_CONTRADICTIONS"
+            side = "hurt"
+        elif dominant == "mixed_with_nonkg_factors":
+            if num_helped_nodes > num_hurt_nodes:
+                count_token = "HELPED_COUNT_HIGHER"
+            elif num_hurt_nodes > num_helped_nodes:
+                count_token = "HURT_COUNT_HIGHER"
+            else:
+                count_token = "COUNTS_EQUAL"
+            base = f"KG_NODES_HELPED_AND_HURT__NON_KG_FACTORS_DROVE_OUTCOME__GRADER_CLEARLY_EXPLAINS_WHICH_NODES_DROVE_OUTCOME__{count_token}__WITH_MINOR_CONTRADICTIONS"
+            side = None
+        else:  # unclear
+            if num_helped_nodes > num_hurt_nodes:
+                count_token = "HELPED_COUNT_HIGHER"
+            elif num_hurt_nodes > num_helped_nodes:
+                count_token = "HURT_COUNT_HIGHER"
+            else:
+                count_token = "COUNTS_EQUAL"
+            base = f"KG_NODES_HELPED_AND_HURT__OUTCOME_DRIVER_UNCLEAR__GRADER_CLEARLY_EXPLAINS_WHICH_NODES_DROVE_OUTCOME__{count_token}__WITH_MINOR_CONTRADICTIONS"
+            side = None
+        return {
+            "kg_influence_label": _build_label(base, side=side, include_push_suffix=True),
+            "assignment_reason": f"Case B CONSISTENT: dominant={dominant}, helped={num_helped_nodes}, hurt={num_hurt_nodes}, contradiction_ratio={contradiction_ratio:.3f}",
+        }
+
+    # ------------------------------------------------------------------
+    # CASE C: not mixed_signals, contradiction_ratio >= 0.25
+    # ------------------------------------------------------------------
+    if not mixed_signals and contradiction_ratio >= 0.25:
+        consistency = high_contradiction_label_consistency or "UNCLEAR"
+        magnitude = _magnitude_token()
+        if num_helped_nodes > 0:
+            side_prefix = "KG_NODES_HELPED"
+            side = "helped"
+        elif num_hurt_nodes > 0:
+            side_prefix = "KG_NODES_HURT"
+            side = "hurt"
+        else:
+            side_prefix = "KG_NO_NET_DIRECTION"
+            side = None
+
+        if consistency == "CONSISTENT":
+            base = f"{side_prefix}__WITH_{magnitude}_CONTRADICTIONS__NON_KG_FACTORS_EXPLAIN_OUTCOME_DESPITE_NODES"
+        elif consistency == "INCONSISTENT":
+            base = f"{side_prefix}__BUT_{magnitude}_CONTRADICTIONS__GRADING_EXPLANATION_INCONSISTENT_WITH_NODES"
+        else:
+            base = f"{side_prefix}__BUT_{magnitude}_CONTRADICTIONS__GRADING_EXPLANATION_UNCLEAR"
+
+        return {
+            "kg_influence_label": _build_label(base, side=side),
+            "assignment_reason": f"Case C: contradiction_ratio={contradiction_ratio:.3f} ({magnitude}), consistency={consistency}, helped={num_helped_nodes}, hurt={num_hurt_nodes}",
+        }
+
+    # ------------------------------------------------------------------
+    # CASE D: mixed_signals, contradiction_ratio >= 0.25
+    # ------------------------------------------------------------------
+    if mixed_signals and contradiction_ratio >= 0.25:
+        cons_4_5 = high_contradiction_label_consistency or "UNCLEAR"
+        cons_4_7 = conflicting_signals_label_consistency or "UNCLEAR"
+        dominant = conflicting_signals_dominant_influence or "unclear"
+        magnitude = _magnitude_token()
+
+        # Both CONSISTENT — trust both analyses
+        if cons_4_5 == "CONSISTENT" and cons_4_7 == "CONSISTENT":
+            combined = "OUTCOME_SENSIBLE_AND_GRADER_CLEARLY_EXPLAINS_DRIVER"
+            if dominant == "helped_nodes":
+                count_token = "RAW_NODE_COUNTS_AGREE_WITH_LLM" if num_helped_nodes > num_hurt_nodes else "RAW_NODE_COUNTS_DISAGREE_WITH_LLM"
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__HELPED_NODES_DROVE_OUTCOME__{combined}__{count_token}"
+                side = "helped"
+            elif dominant == "hurt_nodes":
+                count_token = "RAW_NODE_COUNTS_AGREE_WITH_LLM" if num_hurt_nodes > num_helped_nodes else "RAW_NODE_COUNTS_DISAGREE_WITH_LLM"
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__HURT_NODES_DROVE_OUTCOME__{combined}__{count_token}"
+                side = "hurt"
+            elif dominant == "mixed_with_nonkg_factors":
+                if num_helped_nodes > num_hurt_nodes:
+                    count_token = "HELPED_COUNT_HIGHER"
+                elif num_hurt_nodes > num_helped_nodes:
+                    count_token = "HURT_COUNT_HIGHER"
+                else:
+                    count_token = "COUNTS_EQUAL"
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__NON_KG_FACTORS_DROVE_OUTCOME__{combined}__{count_token}"
+                side = None
+            else:
+                if num_helped_nodes > num_hurt_nodes:
+                    count_token = "HELPED_COUNT_HIGHER"
+                elif num_hurt_nodes > num_helped_nodes:
+                    count_token = "HURT_COUNT_HIGHER"
+                else:
+                    count_token = "COUNTS_EQUAL"
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__OUTCOME_DRIVER_UNCLEAR__{combined}__{count_token}"
+                side = None
+            return {
+                "kg_influence_label": _build_label(base, side=side),
+                "assignment_reason": f"Case D both CONSISTENT: dominant={dominant}, magnitude={magnitude}",
             }
 
-    # ========================================================================
-    # SIMPLE CASES (no conflicting signals and no high contradictions)
-    # ========================================================================
+        # 4.5=CONSISTENT, 4.7=INCONSISTENT
+        if cons_4_5 == "CONSISTENT" and cons_4_7 == "INCONSISTENT":
+            base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__OUTCOME_MAKES_SENSE_DESPITE_CONTRADICTION_NODES__OUTCOME_DRIVER_UNCLEAR__GRADER_EXPLANATION_INTERNALLY_INCONSISTENT"
+            return {"kg_influence_label": _build_label(base), "assignment_reason": f"Case D 4.5=CONSISTENT/4.7=INCONSISTENT: magnitude={magnitude}"}
 
-    if num_helped_nodes > 0 and num_hurt_nodes == 0:
-        return {
-            "kg_influence_label": KG_INFLUENCE_HELPED,
-            "assignment_reason": f"Only helpful nodes ({num_helped_nodes}), no harmful nodes",
-        }
+        # 4.5=CONSISTENT, 4.7=UNCLEAR
+        if cons_4_5 == "CONSISTENT" and cons_4_7 == "UNCLEAR":
+            base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__OUTCOME_MAKES_SENSE_DESPITE_CONTRADICTION_NODES__OUTCOME_DRIVER_UNCLEAR__GRADER_COULD_NOT_DETERMINE_WHICH_NODES_DROVE_OUTCOME"
+            return {"kg_influence_label": _build_label(base), "assignment_reason": f"Case D 4.5=CONSISTENT/4.7=UNCLEAR: magnitude={magnitude}"}
 
-    if num_hurt_nodes > 0 and num_helped_nodes == 0:
-        return {
-            "kg_influence_label": KG_INFLUENCE_HURT,
-            "assignment_reason": f"Only harmful nodes ({num_hurt_nodes}), no helpful nodes",
-        }
+        # 4.5=INCONSISTENT, 4.7=CONSISTENT — trust dominant_influence
+        if cons_4_5 == "INCONSISTENT" and cons_4_7 == "CONSISTENT":
+            surprise = "OUTCOME_SURPRISING_GIVEN_CONTRADICTION_NODE_PATTERN"
+            clearly = "GRADER_CLEARLY_EXPLAINS_WHICH_NODES_DROVE_OUTCOME"
+            if dominant == "helped_nodes":
+                count_token = "RAW_NODE_COUNTS_AGREE_WITH_LLM" if num_helped_nodes > num_hurt_nodes else "RAW_NODE_COUNTS_DISAGREE_WITH_LLM"
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__HELPED_NODES_DROVE_OUTCOME__{surprise}__{clearly}__{count_token}"
+                side = "helped"
+            elif dominant == "hurt_nodes":
+                count_token = "RAW_NODE_COUNTS_AGREE_WITH_LLM" if num_hurt_nodes > num_helped_nodes else "RAW_NODE_COUNTS_DISAGREE_WITH_LLM"
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__HURT_NODES_DROVE_OUTCOME__{surprise}__{clearly}__{count_token}"
+                side = "hurt"
+            elif dominant == "mixed_with_nonkg_factors":
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__NON_KG_FACTORS_DROVE_OUTCOME__{surprise}__{clearly}"
+                side = None
+            else:
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__OUTCOME_DRIVER_UNCLEAR__{surprise}__{clearly}"
+                side = None
+            return {"kg_influence_label": _build_label(base, side=side), "assignment_reason": f"Case D 4.5=INCONSISTENT/4.7=CONSISTENT: dominant={dominant}, magnitude={magnitude}"}
 
-    if num_helped_nodes == 0 and num_hurt_nodes == 0:
-        return {
-            "kg_influence_label": KG_INFLUENCE_NEUTRAL,
-            "assignment_reason": "No nodes had measurable impact (all neutral/diagnostic)",
-        }
+        # 4.5=INCONSISTENT, 4.7=INCONSISTENT
+        if cons_4_5 == "INCONSISTENT" and cons_4_7 == "INCONSISTENT":
+            base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__OUTCOME_SURPRISING_GIVEN_CONTRADICTION_NODE_PATTERN__OUTCOME_DRIVER_UNCLEAR__GRADER_EXPLANATION_INTERNALLY_INCONSISTENT"
+            return {"kg_influence_label": _build_label(base), "assignment_reason": f"Case D both INCONSISTENT: magnitude={magnitude}"}
 
-    # Fallback (should not reach here with valid input)
+        # 4.5=INCONSISTENT, 4.7=UNCLEAR
+        if cons_4_5 == "INCONSISTENT" and cons_4_7 == "UNCLEAR":
+            base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__OUTCOME_SURPRISING_GIVEN_CONTRADICTION_NODE_PATTERN__OUTCOME_DRIVER_UNCLEAR__GRADER_COULD_NOT_DETERMINE_WHICH_NODES_DROVE_OUTCOME"
+            return {"kg_influence_label": _build_label(base), "assignment_reason": f"Case D 4.5=INCONSISTENT/4.7=UNCLEAR: magnitude={magnitude}"}
+
+        # 4.5=UNCLEAR, 4.7=CONSISTENT — trust dominant_influence
+        if cons_4_5 == "UNCLEAR" and cons_4_7 == "CONSISTENT":
+            unclear_cons = "OUTCOME_CONSISTENCY_WITH_CONTRADICTION_NODES_UNCLEAR"
+            clearly = "GRADER_CLEARLY_EXPLAINS_WHICH_NODES_DROVE_OUTCOME"
+            if dominant == "helped_nodes":
+                count_token = "RAW_NODE_COUNTS_AGREE_WITH_LLM" if num_helped_nodes > num_hurt_nodes else "RAW_NODE_COUNTS_DISAGREE_WITH_LLM"
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__HELPED_NODES_DROVE_OUTCOME__{unclear_cons}__{clearly}__{count_token}"
+                side = "helped"
+            elif dominant == "hurt_nodes":
+                count_token = "RAW_NODE_COUNTS_AGREE_WITH_LLM" if num_hurt_nodes > num_helped_nodes else "RAW_NODE_COUNTS_DISAGREE_WITH_LLM"
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__HURT_NODES_DROVE_OUTCOME__{unclear_cons}__{clearly}__{count_token}"
+                side = "hurt"
+            elif dominant == "mixed_with_nonkg_factors":
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__NON_KG_FACTORS_DROVE_OUTCOME__{unclear_cons}__{clearly}"
+                side = None
+            else:
+                base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__OUTCOME_DRIVER_UNCLEAR__{unclear_cons}__{clearly}"
+                side = None
+            return {"kg_influence_label": _build_label(base, side=side), "assignment_reason": f"Case D 4.5=UNCLEAR/4.7=CONSISTENT: dominant={dominant}, magnitude={magnitude}"}
+
+        # 4.5=UNCLEAR, 4.7=INCONSISTENT
+        if cons_4_5 == "UNCLEAR" and cons_4_7 == "INCONSISTENT":
+            base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__OUTCOME_CONSISTENCY_WITH_CONTRADICTION_NODES_UNCLEAR__OUTCOME_DRIVER_UNCLEAR__GRADER_EXPLANATION_INTERNALLY_INCONSISTENT"
+            return {"kg_influence_label": _build_label(base), "assignment_reason": f"Case D 4.5=UNCLEAR/4.7=INCONSISTENT: magnitude={magnitude}"}
+
+        # 4.5=UNCLEAR, 4.7=UNCLEAR
+        base = f"KG_NODES_HELPED_AND_HURT__WITH_{magnitude}_CONTRADICTIONS__OUTCOME_CONSISTENCY_WITH_CONTRADICTION_NODES_UNCLEAR__OUTCOME_DRIVER_UNCLEAR__GRADER_COULD_NOT_DETERMINE_WHICH_NODES_DROVE_OUTCOME"
+        return {"kg_influence_label": _build_label(base), "assignment_reason": f"Case D both UNCLEAR: magnitude={magnitude}"}
+
+    # Fallback (should not reach here)
     logger.warning(
-        "Step 4.2 reached end without assignment. This indicates unexpected input combination. "
-        f"(helped={num_helped_nodes}, hurt={num_hurt_nodes}, contradiction_ratio={contradiction_ratio:.3f})"
+        f"Step 4.2 reached end without assignment (helped={num_helped_nodes}, hurt={num_hurt_nodes}, "
+        f"contradiction_ratio={contradiction_ratio:.3f}, mixed_signals={mixed_signals})"
     )
     return {
-        "kg_influence_label": KG_INFLUENCE_NEUTRAL,
+        "kg_influence_label": f"KG_NODES_PRESENT_IN_RESPONSE_BUT_NO_DIRECTIONAL_EFFECT__{_coverage_token()}{_neutral_tokens()}",
         "assignment_reason": "Fallback: unable to classify with given inputs",
-    }
-
-
-# ============================================================================
-# PART 4.3: CALCULATE CONFIDENCE LEVEL
-# ============================================================================
-
-
-def step_4_3_calculate_confidence_level(
-    contradiction_ratio: float,
-    num_helped_nodes: int,
-    num_hurt_nodes: int,
-) -> dict:
-    """
-    Part 4.3: Calculate confidence level in the KG influence label.
-
-    Confidence is based on node signal quality and consistency.
-
-    Args:
-        contradiction_ratio: Ratio of diagnostic contradiction labels to total nodes
-        num_helped_nodes: Count of HELPED-labeled nodes
-        num_hurt_nodes: Count of HURT-labeled nodes
-
-    Returns:
-        Dict with:
-        - confidence_level: "HIGH" | "MEDIUM" | "LOW"
-        - confidence_reasoning: Brief explanation
-    """
-    logger.info(
-        f"Part 4.3: Calculating confidence level "
-        f"(contradiction_ratio={contradiction_ratio:.3f}, helped={num_helped_nodes}, hurt={num_hurt_nodes})"
-    )
-
-    # HIGH contradiction ratio → LOW confidence
-    if contradiction_ratio >= 0.25:
-        return {
-            "confidence_level": "LOW",
-            "confidence_reasoning": (
-                f"Too many contradictory signals ({contradiction_ratio:.1%} diagnostic labels). "
-                "Outcome is uncertain."
-            ),
-        }
-
-    # Mixed signals (both helped AND hurt) but not too many contradictions → MEDIUM confidence
-    if num_helped_nodes > 0 and num_hurt_nodes > 0:
-        return {
-            "confidence_level": "MEDIUM",
-            "confidence_reasoning": (
-                f"Mixed signals ({num_helped_nodes} helped vs {num_hurt_nodes} hurt) "
-                f"but contradiction ratio is low ({contradiction_ratio:.1%})."
-            ),
-        }
-
-    # Clean signal (only helped OR only hurt OR no nodes) → HIGH confidence
-    return {
-        "confidence_level": "HIGH",
-        "confidence_reasoning": "Clear directional signal from nodes or no nodes present.",
     }
 
 
@@ -1425,35 +1866,22 @@ def step_4_7_analyze_conflicting_signals(
 
 def step_5_1_aggregate_kg_influence_labels(per_criterion_metadata: list) -> dict:
     """
-    Step 5.1: Aggregate KG influence labels per question.
+    Step 5.1: Aggregate KG influence labels per question using prefix-based grouping.
 
-    Groups criteria by kg_influence_label and sums points by prediction category.
+    Groups criteria by kg_label (3-value rollup: kg_helped/kg_hurt/kg_neutral)
+    and sums points by prediction category.
 
     Args:
         per_criterion_metadata: List of criterion metadata dicts from Part 4.
-            Each dict contains:
-            - kg_influence_label: One of 7 labels
-            - points: Integer points for this criterion
-            - Other Part 4 fields
+            Each dict contains kg_label (kg_helped/kg_hurt/kg_neutral) and points.
 
     Returns:
         Dict with:
-        - num_kg_helped_criteria: Count of KG_HELPED + KG_HELPED_DESPITE_CONFLICTS
-        - num_kg_hurt_criteria: Count of KG_HURT + KG_HURT_DESPITE_CONFLICTS
-        - num_kg_uncertain_criteria: Count of KG_NEUTRAL + KG_UNCLEAR_MIXED_SIGNALS + KG_OVERRIDDEN_BY_NON_KG + KG_UNEXPLAINED_CONTRADICTIONS
-        - kg_points_helped: Sum of abs(points) for helped criteria
-        - kg_points_hurt: Sum of abs(points) for hurt criteria
-        - kg_points_uncertain: Sum of abs(points) for uncertain criteria
+        - num_kg_helped_criteria: Count of kg_helped criteria
+        - num_kg_hurt_criteria: Count of kg_hurt criteria
+        - num_kg_uncertain_criteria: Count of kg_neutral criteria
+        - kg_points_helped/hurt/uncertain: Sum of abs(points) per category
     """
-    helped_labels = {"KG_HELPED", "KG_HELPED_DESPITE_CONFLICTS"}
-    hurt_labels = {"KG_HURT", "KG_HURT_DESPITE_CONFLICTS"}
-    uncertain_labels = {
-        "KG_NEUTRAL",
-        "KG_UNCLEAR_MIXED_SIGNALS",
-        "KG_OVERRIDDEN_BY_NON_KG",
-        "KG_UNEXPLAINED_CONTRADICTIONS",
-    }
-
     num_kg_helped_criteria = 0
     num_kg_hurt_criteria = 0
     num_kg_uncertain_criteria = 0
@@ -1462,17 +1890,17 @@ def step_5_1_aggregate_kg_influence_labels(per_criterion_metadata: list) -> dict
     kg_points_uncertain = 0.0
 
     for criterion in per_criterion_metadata:
-        label = criterion.get("kg_influence_label")
+        kg_label = criterion.get("kg_label", "kg_neutral")
         points = criterion.get("points", 0)
         abs_points = abs(points)
 
-        if label in helped_labels:
+        if kg_label == "kg_helped":
             num_kg_helped_criteria += 1
             kg_points_helped += abs_points
-        elif label in hurt_labels:
+        elif kg_label == "kg_hurt":
             num_kg_hurt_criteria += 1
             kg_points_hurt += abs_points
-        elif label in uncertain_labels:
+        else:
             num_kg_uncertain_criteria += 1
             kg_points_uncertain += abs_points
 
@@ -1483,75 +1911,6 @@ def step_5_1_aggregate_kg_influence_labels(per_criterion_metadata: list) -> dict
         "kg_points_helped": kg_points_helped,
         "kg_points_hurt": kg_points_hurt,
         "kg_points_uncertain": kg_points_uncertain,
-    }
-
-
-def step_5_2_aggregate_confidence_level_distribution(
-    per_criterion_metadata: list,
-) -> dict:
-    """
-    Step 5.2: Aggregate confidence level distribution per question.
-
-    Counts criteria by confidence level (HIGH/MEDIUM/LOW) separately for
-    helped and hurt predictions.
-
-    Args:
-        per_criterion_metadata: List of criterion metadata dicts from Part 4.
-            Each dict contains:
-            - kg_influence_label: One of 7 labels
-            - confidence_level: HIGH | MEDIUM | LOW
-
-    Returns:
-        Dict with two sub-dicts:
-        - kg_helped_confidence_breakdown:
-            - num_helped_high_confidence
-            - num_helped_medium_confidence
-            - num_helped_low_confidence
-        - kg_hurt_confidence_breakdown:
-            - num_hurt_high_confidence
-            - num_hurt_medium_confidence
-            - num_hurt_low_confidence
-    """
-    helped_labels = {"KG_HELPED", "KG_HELPED_DESPITE_CONFLICTS"}
-    hurt_labels = {"KG_HURT", "KG_HURT_DESPITE_CONFLICTS"}
-
-    helped_high = 0
-    helped_medium = 0
-    helped_low = 0
-    hurt_high = 0
-    hurt_medium = 0
-    hurt_low = 0
-
-    for criterion in per_criterion_metadata:
-        label = criterion.get("kg_influence_label")
-        confidence = criterion.get("confidence_level")
-
-        if label in helped_labels:
-            if confidence == "HIGH":
-                helped_high += 1
-            elif confidence == "MEDIUM":
-                helped_medium += 1
-            elif confidence == "LOW":
-                helped_low += 1
-        elif label in hurt_labels:
-            if confidence == "HIGH":
-                hurt_high += 1
-            elif confidence == "MEDIUM":
-                hurt_medium += 1
-            elif confidence == "LOW":
-                hurt_low += 1
-
-    return {
-        "kg_helped_confidence_breakdown": {
-            "num_helped_high_confidence": helped_high,
-            "num_helped_medium_confidence": helped_medium,
-            "num_helped_low_confidence": helped_low,
-        },
-        "kg_hurt_confidence_breakdown": {
-            "num_hurt_high_confidence": hurt_high,
-            "num_hurt_medium_confidence": hurt_medium,
-            "num_hurt_low_confidence": hurt_low,
-        },
     }
 
 
@@ -1597,8 +1956,6 @@ def step_5_4_question_level_summary_output(
     per_criterion_metadata: list,
     num_criteria: int,
     kg_influence_summary: dict,
-    kg_helped_confidence_breakdown: dict,
-    kg_hurt_confidence_breakdown: dict,
 ) -> dict:
     """
     Step 5.4: Generate question-level summary output.
@@ -1610,26 +1967,15 @@ def step_5_4_question_level_summary_output(
         per_criterion_metadata: Complete per-criterion metadata from Step 5.3
         num_criteria: Total number of criteria for this question
         kg_influence_summary: Output from Step 5.1
-        kg_helped_confidence_breakdown: From Step 5.2
-        kg_hurt_confidence_breakdown: From Step 5.2
 
     Returns:
-        Dict with complete question-level summary:
-        - question_id
-        - num_criteria
-        - kg_influence_summary (counts + points)
-        - kg_helped_confidence_breakdown
-        - kg_hurt_confidence_breakdown
-        - per_criterion_metadata (all criteria with full metadata)
-
+        Dict with complete question-level summary.
         NOTE: NO final USEKG/DONTUSEKG label. That is reserved for Part 6.
     """
     return {
         "question_id": question_id,
         "num_criteria": num_criteria,
         "kg_influence_summary": kg_influence_summary,
-        "kg_helped_confidence_breakdown": kg_helped_confidence_breakdown,
-        "kg_hurt_confidence_breakdown": kg_hurt_confidence_breakdown,
         "per_criterion_metadata": per_criterion_metadata,
     }
 
@@ -1642,7 +1988,7 @@ def aggregate_part5_for_question(
     """
     Orchestrator for Part 5 aggregation.
 
-    Runs Steps 5.1-5.4 in sequence and returns complete question-level
+    Runs Steps 5.1, 5.3, 5.4 in sequence and returns complete question-level
     metadata aggregation.
 
     Args:
@@ -1658,11 +2004,6 @@ def aggregate_part5_for_question(
         per_criterion_metadata
     )
 
-    # Step 5.2: Aggregate confidence level distribution
-    confidence_data = step_5_2_aggregate_confidence_level_distribution(
-        per_criterion_metadata
-    )
-
     # Step 5.3: Preserve complete per-criterion metadata
     enriched_metadata = step_5_3_preserve_per_criterion_metadata(
         per_criterion_metadata, criteria_data
@@ -1674,10 +2015,6 @@ def aggregate_part5_for_question(
         per_criterion_metadata=enriched_metadata,
         num_criteria=len(criteria_data),
         kg_influence_summary=kg_influence_summary,
-        kg_helped_confidence_breakdown=confidence_data[
-            "kg_helped_confidence_breakdown"
-        ],
-        kg_hurt_confidence_breakdown=confidence_data["kg_hurt_confidence_breakdown"],
     )
 
     return summary
