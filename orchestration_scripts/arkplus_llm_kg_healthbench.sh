@@ -32,6 +32,7 @@ else
     GRAPH_NAME="optimus"                                                # Change this (optimus, prime, etc.)
     SEARCH_MODE="hybrid"                                                # Change this (hybrid, embedding, bm25)
     LIMIT=5000                                                          # Change this
+    REASONING_EFFORT="medium"                                           # Change this (none, low, medium, high, xhigh)
     INPUT_JSONL="/n/holylfs06/LABS/mzitnik_lab/Users/rshamji/rshamji/simple-evals/2025-05-07-06-14-12_oss_eval.jsonl"
     BASE_OUTPUT_DIR="/n/holylfs06/LABS/mzitnik_lab/Users/rshamji/rshamji/simple-evals/results/arkplus_evals"
 
@@ -44,6 +45,9 @@ fi
 ARK_DIR="${ARK_DIR:-/n/holylfs06/LABS/mzitnik_lab/Users/rshamji/rshamji/ark}"
 VENV_PYTHON="${VENV_PYTHON:-python}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Export REASONING_EFFORT so all Python subprocesses (ARK agents, nodes_to_nl, grader, judge) pick it up
+export REASONING_EFFORT="${REASONING_EFFORT:-medium}"
 
 ################################################################################
 # VALIDATION
@@ -122,7 +126,7 @@ else
 
     if [ $? -ne 0 ]; then
         echo -e "${RED}✗ Phase 1A FAILED${NC}"
-        PHASE1A_LINES=$(wc -l < "$PHASE1A_OUTPUT" 2>/dev/null || echo 0)
+        PHASE1A_LINES=$(wc -l "$PHASE1A_OUTPUT" 2>/dev/null | awk '{print $1}' || echo 0)
         log_audit "1a" "end" "failed" ", \"lines_written\": $PHASE1A_LINES"
         exit 1
     fi
@@ -132,6 +136,9 @@ else
     log_audit "1a" "end" "success" ", \"lines_written\": $PHASE1A_LINES"
 fi
 echo ""
+
+# Let Azure token quota recover between Phase 1A and 1B
+sleep 60
 
 ################################################################################
 # PHASE 1B: BASELINE RUN
@@ -159,7 +166,7 @@ else
 
     if [ $? -ne 0 ]; then
         echo -e "${RED}✗ Phase 1B FAILED${NC}"
-        PHASE1B_LINES=$(wc -l < "$PHASE1B_OUTPUT" 2>/dev/null || echo 0)
+        PHASE1B_LINES=$(wc -l "$PHASE1B_OUTPUT" 2>/dev/null | awk '{print $1}' || echo 0)
         log_audit "1b" "end" "failed" ", \"lines_written\": $PHASE1B_LINES"
         exit 1
     fi
@@ -178,7 +185,7 @@ echo -e "${BLUE}PHASE 2A: GRADE KG-GROUNDED RESPONSES${NC}"
 echo ""
 
 PHASE2A_CHECKPOINT="${OUTPUT_DIR}/phase1a_kg_responses_grading_checkpoint.jsonl"
-PHASE2A_EXISTING=$(wc -l < "$PHASE2A_CHECKPOINT" 2>/dev/null || echo 0)
+PHASE2A_EXISTING=$(wc -l "$PHASE2A_CHECKPOINT" 2>/dev/null | awk '{print $1}' || echo 0)
 
 if [ "$PHASE2A_EXISTING" -ge "$LIMIT" ]; then
     echo -e "${GREEN}✓ Phase 2A already complete: ${PHASE2A_EXISTING} lines (skipping)${NC}"
@@ -197,12 +204,12 @@ else
 
     if [ $? -ne 0 ]; then
         echo -e "${RED}✗ Phase 2A FAILED${NC}"
-        CHECKPOINT_LINES=$(wc -l < "$PHASE2A_CHECKPOINT" 2>/dev/null || echo 0)
+        CHECKPOINT_LINES=$(wc -l "$PHASE2A_CHECKPOINT" 2>/dev/null | awk '{print $1}' || echo 0)
         log_audit "2a" "end" "failed" ", \"checkpoint_lines\": $CHECKPOINT_LINES, \"expected_lines\": $LIMIT"
         exit 1
     fi
 
-    CHECKPOINT_LINES=$(wc -l < "$PHASE2A_CHECKPOINT" 2>/dev/null || echo 0)
+    CHECKPOINT_LINES=$(wc -l "$PHASE2A_CHECKPOINT" 2>/dev/null | awk '{print $1}' || echo 0)
     echo -e "${GREEN}✓ Phase 2A complete${NC}"
     log_audit "2a" "end" "success" ", \"graded_lines\": $CHECKPOINT_LINES"
 fi
@@ -216,7 +223,7 @@ echo -e "${BLUE}PHASE 2B: GRADE BASELINE RESPONSES${NC}"
 echo ""
 
 PHASE2B_CHECKPOINT="${OUTPUT_DIR}/phase1b_baseline_responses_grading_checkpoint.jsonl"
-PHASE2B_EXISTING=$(wc -l < "$PHASE2B_CHECKPOINT" 2>/dev/null || echo 0)
+PHASE2B_EXISTING=$(wc -l "$PHASE2B_CHECKPOINT" 2>/dev/null | awk '{print $1}' || echo 0)
 
 if [ "$PHASE2B_EXISTING" -ge "$LIMIT" ]; then
     echo -e "${GREEN}✓ Phase 2B already complete: ${PHASE2B_EXISTING} lines (skipping)${NC}"
@@ -235,12 +242,12 @@ else
 
     if [ $? -ne 0 ]; then
         echo -e "${RED}✗ Phase 2B FAILED${NC}"
-        CHECKPOINT_LINES=$(wc -l < "$PHASE2B_CHECKPOINT" 2>/dev/null || echo 0)
+        CHECKPOINT_LINES=$(wc -l "$PHASE2B_CHECKPOINT" 2>/dev/null | awk '{print $1}' || echo 0)
         log_audit "2b" "end" "failed" ", \"checkpoint_lines\": $CHECKPOINT_LINES, \"expected_lines\": $LIMIT"
         exit 1
     fi
 
-    CHECKPOINT_LINES=$(wc -l < "$PHASE2B_CHECKPOINT" 2>/dev/null || echo 0)
+    CHECKPOINT_LINES=$(wc -l "$PHASE2B_CHECKPOINT" 2>/dev/null | awk '{print $1}' || echo 0)
     echo -e "${GREEN}✓ Phase 2B complete${NC}"
     log_audit "2b" "end" "success" ", \"graded_lines\": $CHECKPOINT_LINES"
 fi
@@ -270,7 +277,7 @@ else
 
     if [ $? -ne 0 ]; then
         echo -e "${RED}✗ Part 5 FAILED${NC}"
-        PART5_LINES=$(wc -l < "$PART5_OUTPUT" 2>/dev/null || echo 0)
+        PART5_LINES=$(wc -l "$PART5_OUTPUT" 2>/dev/null | awk '{print $1}' || echo 0)
         log_audit "5" "end" "failed" ", \"lines_written\": $PART5_LINES"
         exit 1
     fi
@@ -308,7 +315,7 @@ else
 
     if [ $? -ne 0 ]; then
         echo -e "${RED}✗ Part 6 FAILED${NC}"
-        PART6_LINES=$(wc -l < "$PART6_OUTPUT" 2>/dev/null || echo 0)
+        PART6_LINES=$(wc -l "$PART6_OUTPUT" 2>/dev/null | awk '{print $1}' || echo 0)
         log_audit "6" "end" "failed" ", \"lines_written\": $PART6_LINES"
         exit 1
     fi
