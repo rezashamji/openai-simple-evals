@@ -718,12 +718,65 @@ class HealthBenchEval(Eval):
                         # Fallback if Part 3 fails
                         import logging
                         logger = logging.getLogger(__name__)
-                        logger.warning(f"Part 3 labeling failed for node {node_part2['node_id']}: {e}")
+                        import traceback as _tb
+                        logger.warning(f"Part 3 labeling failed for node {node_part2['node_id']}: {e}\n{_tb.format_exc()}")
                         criterion_data["node_labels"].append({
                             "node_id": node_part2["node_id"],
                             "final_node_label": "error_in_labeling",
                             "error": str(e)
                         })
+
+                # Step 3.1.4b: Assign comparative causal weights to cited nodes
+                try:
+                    cited_nodes_for_causal = [
+                        {
+                            "node_index": nl.get("node_id", ""),
+                            "node_summary": next(
+                                (ns.get("summary", "") for ns in node_summaries
+                                 if str(ns.get("index", "")) == str(nl.get("node_id", ""))),
+                                ""
+                            ),
+                            "final_node_contribution_explanation": next(
+                                (pm.get("final_node_contribution_explanation", "")
+                                 for pm in per_node_metadata
+                                 if str(pm.get("node_id", "")) == str(nl.get("node_id", ""))),
+                                ""
+                            ),
+                            "node_used_as_justification_in_grading_explanation_reasoning": nl.get("node_used_as_justification_in_grading_explanation_reasoning", ""),
+                            "node_direction_relative_to_criteria": nl.get("node_direction_relative_to_criteria", ""),
+                            "node_direction_relative_to_criteria_reasoning": nl.get("node_direction_relative_to_criteria_reasoning", ""),
+                            "final_node_label": nl.get("final_node_label", ""),
+                        }
+                        for nl in criterion_data["node_labels"]
+                        if nl.get("node_used_as_justification_in_grading_explanation") is True
+                    ]
+                    if cited_nodes_for_causal:
+                        _causal_model = self.grader_model.model if hasattr(self.grader_model, "model") else "gpt-5.4"
+                        import logging as _logging
+                        _logger = _logging.getLogger(__name__)
+                        _logger.warning(f"[3.1.4b] calling with model={_causal_model!r}, grader_model type={type(self.grader_model)}, grader_model={self.grader_model!r}, num_cited={len(cited_nodes_for_causal)}")
+                        causal_result = kg_node_validation_part2.step_3_1_4b_comparative_causal_weight(
+                            cited_nodes=cited_nodes_for_causal,
+                            criterion_statement=criterion_data.get("criterion_statement", ""),
+                            criteria_met=criterion_data.get("criteria_met", False),
+                            points=criterion_data.get("points", 0),
+                            grading_explanation=criterion_data.get("grading_explanation", ""),
+                            model=_causal_model,
+                        )
+                        # Write causal_weight back onto each cited node in node_labels
+                        causal_by_index = {
+                            str(cw["node_index"]): cw
+                            for cw in causal_result.get("node_causal_weights", [])
+                        }
+                        for nl in criterion_data["node_labels"]:
+                            node_id_str = str(nl.get("node_id", ""))
+                            if node_id_str in causal_by_index:
+                                nl["causal_weight"] = causal_by_index[node_id_str].get("causal_weight")
+                                nl["causal_weight_reasoning"] = causal_by_index[node_id_str].get("reasoning", "")
+                except Exception as e:
+                    import logging, traceback
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Step 3.1.4b failed for criterion: {e}\n{traceback.format_exc()}")
 
                 per_criterion_metadata.append(criterion_data)
 
@@ -742,7 +795,6 @@ class HealthBenchEval(Eval):
                     criterion_data["contradiction_ratio"] = 0.0
                     criterion_data["mixed_signals"] = False
                     criterion_data["kg_influence_label"] = "KG_NEUTRAL"
-                    criterion_data["confidence_level"] = "LOW"
                     criterion_data["kg_label"] = "kg_neutral"
                     criterion_data["kg_reasoning"] = "No nodes available for this criterion"
                     continue
@@ -785,7 +837,8 @@ class HealthBenchEval(Eval):
                         criterion_data["high_contradiction_resolution_insight"] = part4_5_result.get("high_contradiction_resolution_insight")
                         criterion_data["high_contradiction_consistency_reasoning"] = part4_5_result.get("high_contradiction_consistency_reasoning")
                     except Exception as e:
-                        logger.warning(f"Part 4.5 failed for criterion {criterion_idx}: {e}")
+                        import traceback as _tb
+                        logger.warning(f"Part 4.5 failed for criterion {criterion_idx}: {e}\n{_tb.format_exc()}")
 
                 # Step 4.7: Conflicting signals analysis (must run BEFORE 4.2)
                 if criterion_data.get("mixed_signals", False):
@@ -809,14 +862,32 @@ class HealthBenchEval(Eval):
                         logger.warning(f"Part 4.7 failed for criterion {criterion_idx}: {e}")
 
                 # Step 4.2: Assign KG influence label (runs AFTER 4.5 and 4.7 so their outputs are available)
+                max_nodes_allowed = 20  # default; matches --max-nodes-per-question CLI default
                 try:
                     part4_2_result = kg_node_validation_part2.step_4_2_assign_kg_influence_label(
                         num_helped_nodes=criterion_data.get("num_helped_nodes", 0),
                         num_hurt_nodes=criterion_data.get("num_hurt_nodes", 0),
                         num_neutral_nodes=criterion_data.get("num_neutral_nodes", 0),
+                        num_neutral_not_contributed=criterion_data.get("num_neutral_not_contributed", 0),
+                        num_neutral_in_response_not_cited=criterion_data.get("num_neutral_in_response_not_cited", 0),
+                        num_neutral_in_response_direction_unclear=criterion_data.get("num_neutral_in_response_direction_unclear", 0),
                         num_contradiction_nodes=criterion_data.get("num_contradiction_nodes", 0),
+                        num_push_met_but_criterion_not_met=criterion_data.get("num_push_met_but_criterion_not_met", 0),
+                        num_push_not_met_but_criterion_met=criterion_data.get("num_push_not_met_but_criterion_met", 0),
+                        total_nodes=criterion_data.get("total_nodes", 0),
+                        max_nodes_allowed=max_nodes_allowed,
                         contradiction_ratio=criterion_data.get("contradiction_ratio", 0.0),
                         mixed_signals=criterion_data.get("mixed_signals", False),
+                        num_primary_helped=criterion_data.get("num_primary_helped", 0),
+                        num_supporting_helped=criterion_data.get("num_supporting_helped", 0),
+                        num_incidental_helped=criterion_data.get("num_incidental_helped", 0),
+                        num_primary_hurt=criterion_data.get("num_primary_hurt", 0),
+                        num_supporting_hurt=criterion_data.get("num_supporting_hurt", 0),
+                        num_incidental_hurt=criterion_data.get("num_incidental_hurt", 0),
+                        high_contradiction_label_consistency=criterion_data.get("high_contradiction_label_consistency"),
+                        conflicting_signals_label_consistency=criterion_data.get("conflicting_signals_label_consistency"),
+                        conflicting_signals_dominant_influence=criterion_data.get("conflicting_signals_dominant_influence"),
+                        criteria_met=criterion_data.get("criteria_met"),
                     )
                     criterion_data["kg_influence_label"] = part4_2_result.get("kg_influence_label", "KG_NEUTRAL")
                     criterion_data["assignment_reason"] = part4_2_result.get("assignment_reason", "")
@@ -825,25 +896,19 @@ class HealthBenchEval(Eval):
                     criterion_data["kg_influence_label"] = "KG_NEUTRAL"
                     criterion_data["assignment_reason"] = f"Error in assignment: {str(e)}"
 
-                # Step 4.3: Calculate confidence level
-                try:
-                    part4_3_result = kg_node_validation_part2.step_4_3_calculate_confidence_level(
-                        contradiction_ratio=criterion_data.get("contradiction_ratio", 0.0),
-                        num_helped_nodes=criterion_data.get("num_helped_nodes", 0),
-                        num_hurt_nodes=criterion_data.get("num_hurt_nodes", 0),
-                    )
-                    criterion_data["confidence_level"] = part4_3_result.get("confidence_level", "LOW")
-                    criterion_data["confidence_reasoning"] = part4_3_result.get("confidence_reasoning", "")
-                except Exception as e:
-                    logger.warning(f"Part 4.3 failed for criterion {criterion_idx}: {e}")
-                    criterion_data["confidence_level"] = "LOW"
-                    criterion_data["confidence_reasoning"] = f"Error in confidence calc: {str(e)}"
-
-                # For backward compatibility: set kg_label and kg_reasoning based on kg_influence_label
-                kg_label = criterion_data.get("kg_influence_label", "KG_NEUTRAL")
-                if kg_label.startswith("KG_HELPED"):
+                # Derive 3-value kg_label from verbose kg_influence_label
+                kg_inf_label = criterion_data.get("kg_influence_label", "")
+                if kg_inf_label.startswith("KG_NODES_HELPED_AND_HURT"):
+                    # Mixed signals — check dominant influence embedded in label
+                    if "_HELPED_NODES_DROVE_OUTCOME_" in kg_inf_label:
+                        criterion_data["kg_label"] = "kg_helped"
+                    elif "_HURT_NODES_DROVE_OUTCOME_" in kg_inf_label:
+                        criterion_data["kg_label"] = "kg_hurt"
+                    else:
+                        criterion_data["kg_label"] = "kg_neutral"
+                elif kg_inf_label.startswith("KG_NODES_HELPED"):
                     criterion_data["kg_label"] = "kg_helped"
-                elif kg_label.startswith("KG_HURT"):
+                elif kg_inf_label.startswith("KG_NODES_HURT"):
                     criterion_data["kg_label"] = "kg_hurt"
                 else:
                     criterion_data["kg_label"] = "kg_neutral"
@@ -868,13 +933,22 @@ class HealthBenchEval(Eval):
                         "total_nodes": criterion_data.get("total_nodes"),
                         "contradiction_ratio": criterion_data.get("contradiction_ratio"),
                         "mixed_signals": criterion_data.get("mixed_signals"),
+                        # New step_4_1 sub-type counts
+                        "num_neutral_not_contributed": criterion_data.get("num_neutral_not_contributed"),
+                        "num_neutral_in_response_not_cited": criterion_data.get("num_neutral_in_response_not_cited"),
+                        "num_neutral_in_response_direction_unclear": criterion_data.get("num_neutral_in_response_direction_unclear"),
+                        "num_push_met_but_criterion_not_met": criterion_data.get("num_push_met_but_criterion_not_met"),
+                        "num_push_not_met_but_criterion_met": criterion_data.get("num_push_not_met_but_criterion_met"),
+                        "num_primary_helped": criterion_data.get("num_primary_helped"),
+                        "num_supporting_helped": criterion_data.get("num_supporting_helped"),
+                        "num_incidental_helped": criterion_data.get("num_incidental_helped"),
+                        "num_primary_hurt": criterion_data.get("num_primary_hurt"),
+                        "num_supporting_hurt": criterion_data.get("num_supporting_hurt"),
+                        "num_incidental_hurt": criterion_data.get("num_incidental_hurt"),
                         # Part 4.2 fields
                         "kg_label": criterion_data.get("kg_label"),
                         "kg_influence_label": criterion_data.get("kg_influence_label"),
                         "assignment_reason": criterion_data.get("assignment_reason"),
-                        # Part 4.3 fields
-                        "confidence_level": criterion_data.get("confidence_level"),
-                        "confidence_reasoning": criterion_data.get("confidence_reasoning"),
                         # Part 4.5 fields (conditional)
                         "high_contradiction_label_consistency": criterion_data.get("high_contradiction_label_consistency"),
                         "high_contradiction_resolution_insight": criterion_data.get("high_contradiction_resolution_insight"),
@@ -1024,6 +1098,12 @@ def main():
         type=int,
         default=120,
         help="Number of threads to run",
+    )
+    parser.add_argument(
+        "--max-nodes-per-question",
+        type=int,
+        default=20,
+        help="Max KG nodes per question (used for KG coverage calculation in step 4.2)",
     )
     args = parser.parse_args()
 
