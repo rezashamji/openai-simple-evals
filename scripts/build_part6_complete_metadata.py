@@ -249,13 +249,22 @@ def build_phase5_section(p2a: Dict, p2b: Dict, p5: Dict) -> Dict:
                 "contradiction_ratio": criterion_data.get("contradiction_ratio"),
                 "mixed_signals": criterion_data.get("mixed_signals"),
 
+                # From new step_4_1 sub-type counts
+                "num_neutral_not_contributed": criterion_data.get("num_neutral_not_contributed"),
+                "num_neutral_in_response_not_cited": criterion_data.get("num_neutral_in_response_not_cited"),
+                "num_neutral_in_response_direction_unclear": criterion_data.get("num_neutral_in_response_direction_unclear"),
+                "num_push_met_but_criterion_not_met": criterion_data.get("num_push_met_but_criterion_not_met"),
+                "num_push_not_met_but_criterion_met": criterion_data.get("num_push_not_met_but_criterion_met"),
+                "num_primary_helped": criterion_data.get("num_primary_helped"),
+                "num_supporting_helped": criterion_data.get("num_supporting_helped"),
+                "num_incidental_helped": criterion_data.get("num_incidental_helped"),
+                "num_primary_hurt": criterion_data.get("num_primary_hurt"),
+                "num_supporting_hurt": criterion_data.get("num_supporting_hurt"),
+                "num_incidental_hurt": criterion_data.get("num_incidental_hurt"),
+
                 # From Part 4.2: KG Influence Label
                 "kg_influence_label": criterion_data.get("kg_influence_label"),
                 "assignment_reason": criterion_data.get("assignment_reason", ""),
-
-                # From Part 4.3: Confidence
-                "confidence_level": criterion_data.get("confidence_level"),
-                "confidence_reasoning": criterion_data.get("confidence_reasoning", ""),
 
                 # From Part 4.5: High Contradiction Analysis (conditional)
                 "high_contradiction_label_consistency": criterion_data.get("high_contradiction_label_consistency"),
@@ -275,8 +284,6 @@ def build_phase5_section(p2a: Dict, p2b: Dict, p5: Dict) -> Dict:
         "num_criteria": p5.get("num_criteria", len(per_criterion)),
         "kg_relevance_score": p2a.get("example_level_metadata", {}).get("kg_relevance_score"),
         "kg_influence_summary": p5.get("kg_influence_summary", {}),
-        "kg_helped_confidence_breakdown": p5.get("kg_helped_confidence_breakdown", {}),
-        "kg_hurt_confidence_breakdown": p5.get("kg_hurt_confidence_breakdown", {}),
         "per_criterion_metadata": per_criterion,
     }
 
