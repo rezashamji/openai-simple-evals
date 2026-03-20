@@ -118,12 +118,15 @@ class LiteLLMAzureGrader:
         max_tokens: int = 2048,
         max_retries: int = 5,
         retry_base_delay: float = 10.0,
+        reasoning_effort: str | None = None,
     ):
         self.model = model
         self.system_message = system_message
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
+        # reasoning_effort: explicit arg > env var REASONING_EFFORT > None
+        self.reasoning_effort = reasoning_effort or os.environ.get("REASONING_EFFORT") or None
 
     def __call__(self, message_list: MessageList) -> SamplerResponse:
         from litellm import RateLimitError, completion
@@ -134,6 +137,10 @@ class LiteLLMAzureGrader:
         api_base = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get("AZURE_OPENAI_API_BASE") or os.environ.get("AZURE_API_BASE")
         api_version = os.environ.get("AZURE_OPENAI_API_VERSION") or os.environ.get("AZURE_API_VERSION")
 
+        extra_args = {}
+        if self.reasoning_effort:
+            extra_args["reasoning_effort"] = self.reasoning_effort
+
         last_error = None
         for attempt in range(self.max_retries):
             try:
@@ -141,11 +148,12 @@ class LiteLLMAzureGrader:
                     model=self.model,
                     messages=message_list,
                     max_tokens=self.max_tokens,
-                    timeout=60,
+                    timeout=120,
                     num_retries=0,
                     api_key=api_key,
                     api_base=api_base,
                     api_version=api_version,
+                    **extra_args,
                 )
                 content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
                 return SamplerResponse(
