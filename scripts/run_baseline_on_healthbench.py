@@ -236,11 +236,21 @@ def main():
 
         new_results: dict[int, dict] = {}
         n_workers = max(1, int(args.n_workers))
+        import threading
+        _cp_lock = threading.Lock()
+
+        def _append_result(out: dict) -> None:
+            """Append one result to checkpoint immediately so progress survives crashes."""
+            with _cp_lock:
+                with open(output_path, "a", encoding="utf-8") as cp_f:
+                    cp_f.write(json.dumps(out, ensure_ascii=False) + "\n")
+
         if n_workers == 1:
             # Sequential evaluation
             for k, i in enumerate(to_compute):
                 _, out = process_one(i)
                 new_results[i] = out
+                _append_result(out)
                 if (k + 1) % 10 == 0 or (k + 1) == len(to_compute):
                     print(f"  {k + 1}/{len(to_compute)} completed.", file=sys.stderr)
         else:
@@ -251,14 +261,10 @@ def main():
                 for future in as_completed(futures):
                     i, out = future.result()
                     new_results[i] = out
+                    _append_result(out)
                     done += 1
                     if done % 10 == 0 or done == len(to_compute):
                         print(f"  {done}/{len(to_compute)} completed.", file=sys.stderr)
-
-        # Append new results to output file
-        with open(output_path, "a", encoding="utf-8") as f:
-            for result in new_results.values():
-                f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
         print(f"Appended {len(new_results)} new results to {output_path}", file=sys.stderr)
 
