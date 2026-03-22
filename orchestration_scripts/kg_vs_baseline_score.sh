@@ -29,7 +29,7 @@ NC='\033[0m'
 ################################################################################
 LLM_MODEL="azure/gpt-5.4"          # Change this
 KG_NAME="optimus"                  # Change this (optimus, prime, etc.)
-SEARCH_MODE="embedding"            # Change this (hybrid, embedding, bm25)
+SEARCH_MODE="hybrid"               # Change this (hybrid, embedding, bm25)
 LIMIT=5000                            # Change this
 REASONING_EFFORT="medium"          # Change this (none, low, medium, high, xhigh)
 
@@ -46,7 +46,7 @@ ARK_PYTHON="${PROJECT_ROOT}/ark/.venv/bin/python"
 # Generate output folder
 MODEL_FOLDER=$(echo "$LLM_MODEL" | sed 's/.*\///; s/\./-/g; s/-//')
 JOB_ID=${SLURM_JOB_ID:-"local"}
-OUTPUT_DIR="$BASE_OUTPUT_DIR/${MODEL_FOLDER}_${KG_NAME}_${SEARCH_MODE}_kg_vs_baseline_${JOB_ID}"
+OUTPUT_DIR="$BASE_OUTPUT_DIR/${JOB_ID}_${MODEL_FOLDER}_${KG_NAME}_${SEARCH_MODE}_kg_vs_baseline"
 
 ################################################################################
 # ENVIRONMENT SETUP
@@ -142,9 +142,9 @@ else
         --graph-name "$KG_NAME" \
         --search-mode "$SEARCH_MODE" \
         --ark-model "$LLM_MODEL" \
-        --ark-agents 2 \
+        --ark-agents 1 \
         --ark-max-steps 10 \
-        --n-workers 2 \
+        --n-workers 4 \
         --limit "$LIMIT" \
         --run-tag "kg_grounded" \
         --log-interval 100 \
@@ -222,7 +222,7 @@ else
         --responses-jsonl "$PHASE1A_OUTPUT" \
         --output-dir "$OUTPUT_DIR" \
         --examples "$LIMIT" \
-        --n-workers-phase2a 2 \
+        --n-workers-phase2a 4 \
         --skip-on-error \
         --log-interval 100 \
         2>&1 | tee "${OUTPUT_DIR}/phase2a_kg.log"
@@ -260,7 +260,7 @@ else
         --responses-jsonl "$PHASE1B_OUTPUT" \
         --output-dir "$OUTPUT_DIR" \
         --examples "$LIMIT" \
-        --n-workers-phase2a 2 \
+        --n-workers-phase2a 4 \
         --skip-on-error \
         --log-interval 100 \
         2>&1 | tee "${OUTPUT_DIR}/phase2b_baseline.log"
