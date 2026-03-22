@@ -23,6 +23,8 @@ LLM_MODEL="azure/gpt-5.4"          # Change to any model (e.g., "azure/gpt-4.1",
 KG_NAME="optimus"                  # Change to any KG (e.g., "optimus", "prime")
 SEARCH_MODE="embedding"            # Fixed for this batch file
 LIMIT=5000
+REASONING_EFFORT="medium"          # Change this (none, low, medium, high, xhigh)
+export REASONING_EFFORT
 
 
 ################################################################################
