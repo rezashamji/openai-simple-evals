@@ -422,7 +422,9 @@ def main():
             "--max_steps", str(args.ark_max_steps),
             "--number_of_agents", str(args.ark_agents),
             "--search-mode", args.search_mode,
+            "--prompt-file", "prompts/healthbench_system_prompt.md",
         ]
+        print(f"[ARK_PROMPT] Using system prompt: prompts/healthbench_system_prompt.md", file=sys.stderr)
         # If using embedding/hybrid search, compute embeddings path
         if args.search_mode in ["embedding", "hybrid"]:
             graph_dir = ark_dir / "benchmarks" / "stark" / "data" / "graphs" / args.graph_name
