@@ -36,9 +36,10 @@ else
     INPUT_JSONL="/n/holylfs06/LABS/mzitnik_lab/Users/rshamji/rshamji/simple-evals/2025-05-07-06-14-12_oss_eval.jsonl"
     BASE_OUTPUT_DIR="/n/holylfs06/LABS/mzitnik_lab/Users/rshamji/rshamji/simple-evals/results/arkplus_evals"
 
-    # Auto-generate folder name: MODEL_KG_SEARCH_kg (for standalone KG runs)
+    # Auto-generate folder name: JOBID_MODEL_KG_SEARCH_kg (for standalone KG runs)
     MODEL_FOLDER=$(echo "$LLM_MODEL" | sed 's/.*\///; s/\./-/g; s/-//')
-    OUTPUT_DIR="$BASE_OUTPUT_DIR/${MODEL_FOLDER}_${GRAPH_NAME}_${SEARCH_MODE}_kg_standalone"
+    JOB_ID=${SLURM_JOB_ID:-"local"}
+    OUTPUT_DIR="$BASE_OUTPUT_DIR/${JOB_ID}_${MODEL_FOLDER}_${GRAPH_NAME}_${SEARCH_MODE}_kg_standalone"
 fi
 
 # Defaults
