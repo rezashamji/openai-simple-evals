@@ -87,7 +87,7 @@ def call_gpt_baseline(
             response = completion(
                 model=model_name,
                 messages=messages,
-                max_tokens=2048,
+                max_tokens=8192,
                 timeout=120,
                 num_retries=0,
                 api_key=api_key,
